@@ -76,12 +76,13 @@ class _CenterPointBackboneNeckHeadExportWrapper(nn.Module):
         Args:
             backbone: BEV backbone.
             neck: BEV neck.
-            bbox_head: CenterPoint dense head. An export-ready copy is taken.
+            bbox_head: Export-ready CenterPoint dense head
+                (:meth:`~autoware_ml.models.detection3d.heads.centerhead.CenterHead.prepare_for_export`).
         """
         super().__init__()
         self.backbone = backbone
         self.neck = neck
-        self.bbox_head = bbox_head.prepare_for_export()
+        self.bbox_head = bbox_head
         # The order the deployed runtime expects, the velocity branch last. Do not reorder.
         self.output_names = ["heatmap", "reg", "height", "dim", "rot"]
         if self.bbox_head.use_velocity:
@@ -273,8 +274,10 @@ class CenterPointDetection3DModel(ModuleBaseModel):
                 )
             }
 
+        # The graphs trace the live backbone and neck; the head is traced on its export-ready
+        # copy, so the stages are rebuilt after a module is replaced (see build_stages()).
         head_wrapper = _CenterPointBackboneNeckHeadExportWrapper(
-            self.pts_backbone, self.pts_neck, self.bbox_head
+            self.pts_backbone, self.pts_neck, self.bbox_head.prepare_for_export()
         )
         return (
             TorchStage("decorate", run=decorate, inputs=(), outputs=("input_features",)),
