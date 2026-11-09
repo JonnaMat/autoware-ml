@@ -120,7 +120,9 @@ class GraphStage:
 
     Attributes:
         name: Unique stage name, also the ``deploy.onnx.modules`` key and the artifact stem.
-        module: The traced module; its positional arguments are the ``inputs`` tensors.
+        module: The traced module, export-ready as declared (the live submodule or an
+            export copy); its positional arguments are the ``inputs`` tensors. The framework
+            runs and traces it and never alters it.
         inputs: Run-state names fed to the module, in order; they are the ONNX input names.
         outputs: ONNX output names, in the module's return order. Those no later stage
             reads are the model outputs (:func:`model_output_names`).

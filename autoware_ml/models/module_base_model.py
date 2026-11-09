@@ -423,9 +423,14 @@ class ModuleBaseModel(MetricEvalMixin, L.LightningModule, ABC):
     def build_stages(self) -> Sequence[Stage] | None:
         """Declare the deployment stage graph, or return ``None`` for a model without one.
 
-        When declared, :meth:`build_export_specs` derives from it. Each call builds fresh
-        export wrappers, some holding copies of submodules (CenterPoint's head), so call it
-        after replacing modules (e.g. with quantized ones) instead of reusing earlier stages.
+        When declared, :meth:`build_export_specs` derives from it. The contract:
+
+        * Every ``GraphStage.module`` is export-ready when returned: the live submodule
+          where tracing it is fine, otherwise the copy its ``prepare_for_export()`` makes.
+          The framework runs and traces the module and never alters it.
+        * The method is pure and cheap enough to call again: callers build the stages after
+          replacing modules (e.g. with quantized ones) instead of reusing earlier stages, so
+          a copy made here never goes stale.
 
         Returns:
             The ordered stages, or ``None``.
