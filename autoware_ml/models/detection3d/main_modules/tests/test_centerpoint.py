@@ -23,11 +23,13 @@ import onnx
 import torch
 
 from autoware_ml.dataclasses.models.model_batch_inputs import ModelBatchInputs
+from autoware_ml.dataclasses.models.model_outputs import ModelOutputs
 from autoware_ml.dataclasses.batch.detection3d import (
     Detection3DGTBatch,
 )
 from autoware_ml.dataclasses.batch.sample_batch import ModelGTBatch
-from autoware_ml.deployment.stages import GraphStage, model_output_names, run_stages_in_torch
+from autoware_ml.deployment.stages import GraphStage, model_output_names
+from autoware_ml.deployment.tests.stage_graph_fixtures import assert_stage_graph_reproduces_forward
 from autoware_ml.models.detection3d.main_modules.centerpoint import (
     CenterPointDetection3DModel,
     _CenterPointBackboneNeckHeadExportWrapper,
@@ -200,6 +202,16 @@ class TestCenterPointDetection3DModel(unittest.TestCase):
             image_data=None,
             range_view_data=None,
         )
+
+    @staticmethod
+    def _head_tensors(outputs: ModelOutputs) -> dict[str, torch.Tensor]:
+        """Return forward()'s head maps under the names the deployed graph gives them."""
+        head_outputs = outputs.detection3d().center_head()
+        return {
+            name: getattr(head_outputs, name)
+            for name in ["heatmap", "reg", "height", "dim", "rot", "vel"]
+            if getattr(head_outputs, name) is not None
+        }
 
     def test_centerpoint_forward_compute_metrics_and_decode_run(self) -> None:
         """
@@ -391,14 +403,16 @@ class TestCenterPointDetection3DModel(unittest.TestCase):
         names = ["heatmap", "reg", "height", "dim", "rot", "vel"]
         self.assertEqual(model_output_names(stages), tuple(names))
 
-        with torch.no_grad():
-            forward_outputs = self.centerpoint(multi_task_batch_inputs)
-        expected = forward_outputs.detection3d().center_head()
-        state = run_stages_in_torch(stages, multi_task_batch_inputs, self.device)
-        for name in names:
-            # Same modules, so only CUDA kernel-selection noise remains: two forward() calls
-            # differ by up to 1.3e-4 on a shared GPU. A wrong dataflow would be off by O(1).
-            torch.testing.assert_close(state[name], getattr(expected, name), rtol=1e-3, atol=1e-3)
+        # Same modules, so only CUDA kernel-selection noise remains: two forward() calls
+        # differ by up to 1.3e-4 on a shared GPU.
+        assert_stage_graph_reproduces_forward(
+            self.centerpoint,
+            multi_task_batch_inputs,
+            self.device,
+            self._head_tensors,
+            rtol=1e-3,
+            atol=1e-3,
+        )
 
     def test_stage_graph_runs_on_deployment_inputs_without_ground_truth(self) -> None:
         """Test that voxels with an empty GT batch, as a runtime feeds them, trace both graphs."""
@@ -431,7 +445,6 @@ class TestCenterPointDetection3DModel(unittest.TestCase):
         the last sample of a batch or the only one.
         """
         self.centerpoint.eval()
-        stages = self.centerpoint.build_stages()
         batch_inputs = self._build_multi_task_batch_inputs()
         voxels_data = batch_inputs.voxels_data
         gt_batch = batch_inputs.multi_task_gt_batch
@@ -467,15 +480,8 @@ class TestCenterPointDetection3DModel(unittest.TestCase):
         }
         for case, inputs in cases.items():
             with self.subTest(case=case):
-                with torch.no_grad():
-                    forward_outputs = self.centerpoint(inputs)
-                state = run_stages_in_torch(stages, inputs, self.device)
-
-                torch.testing.assert_close(
-                    state["heatmap"],
-                    forward_outputs.detection3d().center_head().heatmap,
-                    rtol=1e-3,
-                    atol=1e-3,
+                assert_stage_graph_reproduces_forward(
+                    self.centerpoint, inputs, self.device, self._head_tensors, rtol=1e-3, atol=1e-3
                 )
 
 
