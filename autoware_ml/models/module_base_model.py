@@ -41,6 +41,7 @@ from autoware_ml.metrics.eval_mixin import MetricEvalMixin
 from autoware_ml.preprocessing.data_preprocessor import DataPreprocessor
 from autoware_ml.types.dataset import SplitType
 from autoware_ml.utils.deploy import ExportSpec
+from autoware_ml.utils.deployed_graphs import DeployedGraphs
 from autoware_ml.utils.optimizer import build_lightning_optimizer_config
 
 
@@ -96,6 +97,7 @@ class ModuleBaseModel(MetricEvalMixin, L.LightningModule, ABC):
         optimizer_group_overrides: Mapping[str, Mapping[str, Any]] | None = None,
         scheduler_config: Mapping[str, Any] | None = None,
         metrics: Sequence[MetricSuite] | None = None,
+        deployed_graphs: DeployedGraphs | None = None,
     ):
         """Initialize base model.
 
@@ -110,6 +112,8 @@ class ModuleBaseModel(MetricEvalMixin, L.LightningModule, ABC):
                 ``interval`` or ``monitor``.
             metrics: Task metrics accumulated during validation and test. Empty
                 or ``None`` logs only losses.
+            deployed_graphs: Exported graphs that :meth:`run_deployed` runs in place of
+                :meth:`forward`, so the deployed model is scored like the trained one.
         """
         super().__init__(metrics=metrics)
         self._data_preprocessor = data_preprocessor
@@ -120,6 +124,7 @@ class ModuleBaseModel(MetricEvalMixin, L.LightningModule, ABC):
         )
         self.scheduler_config = dict(scheduler_config) if scheduler_config else {}
         self.log_dict_configs = log_dict_configs
+        self.deployed_graphs = deployed_graphs
 
     def setup(self, stage: str) -> None:
         """Check the datamodule against the needs of the model.
@@ -270,7 +275,7 @@ class ModuleBaseModel(MetricEvalMixin, L.LightningModule, ABC):
             Tuple of the metric dictionary (as a ``MappingProxyType``) and the raw model outputs.
             The metric dictionary contains at least a ``"loss"`` key.
         """
-        outputs = self(multi_task_batch_inputs)
+        outputs = self.compute_outputs(multi_task_batch_inputs)
         metrics = self.compute_metrics(multi_task_batch_inputs, outputs)
         if "loss" not in metrics:
             raise ValueError("compute_metrics() must return a dict containing a 'loss' key.")
@@ -292,6 +297,12 @@ class ModuleBaseModel(MetricEvalMixin, L.LightningModule, ABC):
             rank_zero_only=self.log_dict_configs.rank_zero_only,
         )
         return metrics, outputs
+
+    def compute_outputs(self, multi_task_batch_inputs: ModelBatchInputs) -> ModelOutputs:
+        """Run the model, or its deployed graphs when the model was given them."""
+        if self.deployed_graphs is None:
+            return self(multi_task_batch_inputs)
+        return self.run_deployed(multi_task_batch_inputs, self.deployed_graphs)
 
     @final
     def training_step(
@@ -372,7 +383,7 @@ class ModuleBaseModel(MetricEvalMixin, L.LightningModule, ABC):
         Returns:
             Predictions after decoding the raw model outputs.
         """
-        outputs = self(multi_task_batch_inputs)
+        outputs = self.compute_outputs(multi_task_batch_inputs)
         return self.decode_outputs(multi_task_batch_inputs, outputs)
 
     def configure_optimizers(self) -> Optimizer | dict[str, Any]:
@@ -447,3 +458,19 @@ class ModuleBaseModel(MetricEvalMixin, L.LightningModule, ABC):
             Model outputs as :meth:`forward` returns them.
         """
         raise NotImplementedError(f"{type(self).__name__} does not rebuild exported outputs.")
+
+    def run_deployed(
+        self, multi_task_batch_inputs: ModelBatchInputs, graphs: DeployedGraphs
+    ) -> ModelOutputs:
+        """Run the exported graphs by name, with what the runtime computes around them in PyTorch.
+
+        Models that support deployed evaluation override this hook.
+
+        Args:
+            multi_task_batch_inputs: Model inputs, as :meth:`forward` takes them.
+            graphs: The exported graphs, as engines or as the export modules.
+
+        Returns:
+            Model outputs as :meth:`forward` returns them.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not run its exported graphs.")

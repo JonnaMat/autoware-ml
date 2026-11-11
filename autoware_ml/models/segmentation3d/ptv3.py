@@ -40,7 +40,6 @@ from autoware_ml.models.segmentation3d.heads.ptv3 import (
 )
 from autoware_ml.models.module_base_model import LogDictConfigs
 from autoware_ml.models.segmentation3d.ptv3_base import (
-    PTv3TensorRTMixin,
     SERIALIZED_POOLING_FIELDS,
     PTv3BaseModel,
     PTv3EncoderExportBase,
@@ -117,6 +116,8 @@ class _PTv3Segmentation3DExportModule(PTv3EncoderExportBase):
 
 class PTv3Segmentation3DModel(PTv3BaseModel):
     """Wrap PTv3 semantic segmentation in the shared training interface."""
+
+    EXPORT_HEAD_NAMES = ("ptv3_seg3d_head",)
 
     def __init__(
         self,
@@ -280,9 +281,3 @@ class PTv3Segmentation3DModel(PTv3BaseModel):
                 self.get_export_output_names(),
             ),
         }
-
-
-class PTv3Segmentation3DTensorRTModel(PTv3TensorRTMixin, PTv3Segmentation3DModel):
-    """PTv3 segmentation whose exported graphs run as TensorRT engines."""
-
-    ENGINE_NAMES = ("ptv3_encoder", "ptv3_seg3d_head")

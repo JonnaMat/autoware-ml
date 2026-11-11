@@ -14,7 +14,6 @@ from autoware_ml.dataclasses.geometry.voxels import VoxelsData
 from autoware_ml.dataclasses.models.model_batch_inputs import ModelBatchInputs
 from autoware_ml.dataclasses.models.model_outputs import ModelOutputs
 from autoware_ml.dataclasses.models.segmentation3d.head_outputs import Segmentation3DHeadOutputs
-from autoware_ml.deployment.tensorrt_engine import TensorRTModelMixin
 from autoware_ml.models.module_base_model import LogDictConfigs, ModuleBaseModel
 from autoware_ml.models.segmentation3d.encoders.ptv3 import (
     Block,
@@ -28,6 +27,7 @@ from autoware_ml.models.segmentation3d.encoders.ptv3 import (
 )
 from autoware_ml.models.segmentation3d.encoders.voxel import VoxelFeatureEncoder
 from autoware_ml.utils.deploy import ExportSpec
+from autoware_ml.utils.deployed_graphs import DeployedGraphs
 from autoware_ml.utils.point_cloud.batching import batch_to_offset
 from autoware_ml.utils.point_cloud.structures import (
     Point,
@@ -123,6 +123,7 @@ class PTv3BaseModel(ModuleBaseModel):
     """
 
     EXPORT_ORDER = ("z", "z-trans")
+    EXPORT_HEAD_NAMES: tuple[str, ...]
     EXPORT_SUPPORTED_STAGES = frozenset({"onnx"})
 
     def __init__(
@@ -304,6 +305,36 @@ class PTv3BaseModel(ModuleBaseModel):
             export_patch_sizes(self),
         )
 
+    def run_deployed(
+        self, multi_task_batch_inputs: ModelBatchInputs, graphs: DeployedGraphs
+    ) -> ModelOutputs:
+        """Serialize every sample as the export does and run the exported graphs on it.
+
+        The graphs take one sample each, so the head outputs are concatenated over the samples.
+        """
+        samples = split_voxels_by_sample(
+            _voxels_data(multi_task_batch_inputs), multi_task_batch_inputs.batch_size()
+        )
+        per_sample = [self.run_deployed_sample(*sample, graphs) for sample in samples]
+        return self.outputs_from_export_tensors(
+            {name: torch.cat([outputs[name] for outputs in per_sample]) for name in per_sample[0]}
+        )
+
+    def run_deployed_sample(
+        self,
+        voxels: torch.Tensor,
+        num_points: torch.Tensor,
+        grid_coord: torch.Tensor,
+        graphs: DeployedGraphs,
+    ) -> dict[str, torch.Tensor]:
+        """Run the encoder graph and every head graph on one sample and return the head outputs."""
+        tensors = self.serialize_for_export(voxels, num_points, grid_coord).named_tensors()
+        tensors |= graphs("ptv3_encoder", tensors)
+        head_outputs: dict[str, torch.Tensor] = {}
+        for name in self.EXPORT_HEAD_NAMES:
+            head_outputs |= graphs(name, tensors)
+        return head_outputs
+
     def _prepare_encoder_export(self) -> PointTransformerV3Encoder:
         """Return an export-ready copy of the encoder.
 
@@ -332,32 +363,6 @@ def ptv3_export_geometry(
     serialization_depth = bit_length_tensor(torch.max(axis_extents))
     sparse_shape = torch.round(axis_extents).to(dtype=torch.long)
     return sparse_shape, serialization_depth
-
-
-class PTv3TensorRTMixin(TensorRTModelMixin):
-    """Run a PTv3 model's exported graphs as TensorRT engines, one sample at a time.
-
-    Mixed in ahead of a PTv3 task model, whose ``outputs_from_export_tensors`` rebuilds the
-    outputs; the exported graphs take one sample each.
-    """
-
-    def forward(self, multi_task_batch_inputs: ModelBatchInputs) -> ModelOutputs:
-        """Serialize every sample as the export does and run the engines on it.
-
-        Args:
-            multi_task_batch_inputs: Model inputs holding the voxels.
-
-        Returns:
-            The model outputs rebuilt from the engine outputs.
-        """
-        samples = [
-            self.serialize_for_export(voxels, num_points, grid_coord)
-            for voxels, num_points, grid_coord in split_voxels_by_sample(
-                _voxels_data(multi_task_batch_inputs), multi_task_batch_inputs.batch_size()
-            )
-        ]
-        tensors = run_export_graphs(list(self.engines.values()), samples)
-        return self.outputs_from_export_tensors(tensors)
 
 
 def build_serialized_pooling_metadata(
@@ -824,36 +829,6 @@ def split_voxels_by_sample(
             voxels_data.coords.split(counts),
         )
     )
-
-
-def run_export_graphs(
-    graphs: Sequence[Any], samples: Sequence[PTv3ExportInputs]
-) -> dict[str, torch.Tensor]:
-    """Run the deployed graphs on every sample, each reading the tensors before it by name.
-
-    Args:
-        graphs: Callables taking and returning tensors keyed by their export names, in
-            dataflow order, such as TensorRT engines.
-        samples: The inputs of the graphs, one per sample.
-
-    Returns:
-        The outputs no later graph reads, concatenated over the samples along the first axis.
-    """
-    per_sample = []
-    for sample in samples:
-        tensors = sample.named_tensors()
-        outputs: dict[str, torch.Tensor] = {}
-        for graph in graphs:
-            produced = graph(tensors)
-            tensors |= produced
-            outputs |= produced
-        per_sample.append(outputs)
-    read = {name for graph in graphs for name in graph.input_names}
-    return {
-        name: torch.cat([outputs[name] for outputs in per_sample])
-        for name in per_sample[0]
-        if name not in read
-    }
 
 
 def seg3d_head_outputs_from_export(

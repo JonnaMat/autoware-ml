@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from pathlib import Path
-
 import pytest
 import torch
 
@@ -15,35 +12,12 @@ from autoware_ml.dataclasses.models.detection3d.head_outputs import (
 )
 from autoware_ml.models.detection3d.tests.head_output_fixtures import build_transfusion_outputs
 from autoware_ml.models.detection3d.tests.ptv3_detection3d_fixtures import build_inputs
-from autoware_ml.models.module_base_model import LogDictConfigs
-from autoware_ml.models.multi.ptv3_det3d_seg3d import PTv3Det3DSeg3DTensorRTModel
 from autoware_ml.models.multi.tests.test_ptv3_det3d_seg3d_export import (
-    JOINT_EXPORT_OUTPUT_NAMES,
     _build_det3d_seg3d_model,
 )
-from autoware_ml.preprocessing.data_preprocessor import DataPreprocessor
-from autoware_ml.models.segmentation3d.ptv3_base import (
-    prepare_ptv3_export_inputs,
-    run_export_graphs,
-    split_voxels_by_sample,
-)
+from autoware_ml.models.segmentation3d.ptv3_base import split_voxels_by_sample
 from autoware_ml.ops.spconv.availability import IS_SPCONV_AVAILABLE
-from autoware_ml.utils.deploy import ExportSpec
-
-
-class TorchGraph:
-    """An export spec's module called the way a deployed engine is, on named tensors."""
-
-    def __init__(self, spec: ExportSpec) -> None:
-        self.spec = spec
-        self.input_names = tuple(spec.input_names)
-
-    def __call__(self, tensors: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        with torch.no_grad():
-            outputs = self.spec.module(*(tensors[name] for name in self.input_names))
-        if isinstance(outputs, torch.Tensor):
-            outputs = (outputs,)
-        return dict(zip(self.spec.output_names, outputs, strict=True))
+from autoware_ml.utils.deployed_graphs import TorchGraphs
 
 
 def test_center_head_outputs_round_trip_through_export_tensors() -> None:
@@ -56,9 +30,7 @@ def test_center_head_outputs_round_trip_through_export_tensors() -> None:
         rot=torch.rand(2, 2, 4, 4),
         vel=None,
     )
-    rebuilt = CenterHeadOutputs.from_export_tensors(
-        dict(zip(names, outputs.export_tensors(names)))
-    )
+    rebuilt = CenterHeadOutputs.from_export_tensors(dict(zip(names, outputs.export_tensors(names))))
     assert rebuilt.vel is None
     for name in names:
         assert torch.equal(getattr(rebuilt, name), getattr(outputs, name))
@@ -115,54 +87,20 @@ def test_split_voxels_by_sample_refuses_ungrouped_or_empty_samples(
     not IS_SPCONV_AVAILABLE or not torch.cuda.is_available(),
     reason="PTv3 sparse-convolution export tests require CUDA spconv",
 )
-def test_export_graphs_on_named_tensors_rebuild_the_model_outputs() -> None:
+def test_run_deployed_matches_the_export_modules_on_their_trace_inputs() -> None:
     model = _build_det3d_seg3d_model().cuda().eval()
     batch = build_inputs(device=torch.device("cuda"), is_training=False)
     specs = model.build_export_specs(batch)
-    graphs = [TorchGraph(spec) for spec in specs.values()]
-
-    tensors = run_export_graphs(graphs, [prepare_ptv3_export_inputs(model, batch)])
-
-    # The encoder features feed the heads, so only the head outputs are model outputs.
-    head_outputs = [*specs["ptv3_seg3d_head"].output_names, *specs["ptv3_det3d_head"].output_names]
-    assert sorted(tensors) == sorted(head_outputs)
-    outputs = model.outputs_from_export_tensors(tensors)
-    assert torch.equal(outputs.segmentation3d().logits.argmax(dim=1), tensors["pred_labels"])
-    predictions = model.decode_outputs(batch, outputs)
-    assert len(predictions.detection3d_predictions) == 1
-
-
-@pytest.mark.skipif(
-    not IS_SPCONV_AVAILABLE or not torch.cuda.is_available(),
-    reason="PTv3 sparse-convolution export tests require CUDA spconv",
-)
-def test_tensorrt_model_runs_the_engines_on_every_sample(tmp_path: Path) -> None:
-    model = _build_det3d_seg3d_model().cuda().eval()
-    batch = build_inputs(device=torch.device("cuda"), is_training=False)
-    specs = model.build_export_specs(batch)
-    for name in PTv3Det3DSeg3DTensorRTModel.ENGINE_NAMES:
-        (tmp_path / f"{name}.engine").touch()
-    deployed = PTv3Det3DSeg3DTensorRTModel(
-        engine_dir=tmp_path,
-        log_dict_configs=LogDictConfigs(prog_bar=False),
-        data_preprocessor=DataPreprocessor(preprocessor_modules=[]),
-        encoder=model.encoder,
-        voxel_encoder=model.voxel_encoder,
-        seg3d_head=model.seg3d_head,
-        bev_neck=model.bev_neck,
-        bbox_head=model.bbox_head,
-        export_output_names=JOINT_EXPORT_OUTPUT_NAMES,
-        grid_size=1.0,
-        point_cloud_range=[0.0, 0.0, -2.0, 8.0, 8.0, 2.0],
-    ).eval()
-    deployed.engines = {name: TorchGraph(spec) for name, spec in specs.items()}
-
-    expected = run_export_graphs(
-        list(deployed.engines.values()), [prepare_ptv3_export_inputs(model, batch)]
-    )
+    expected = {}
     with torch.no_grad():
-        outputs = deployed(batch)
+        for name in model.EXPORT_HEAD_NAMES:
+            spec = specs[name]
+            expected |= dict(zip(spec.output_names, spec.module(*spec.args), strict=True))
+
+        outputs = model.run_deployed(batch, TorchGraphs(specs))
+
     assert torch.equal(outputs.segmentation3d().logits.argmax(dim=1), expected["pred_labels"])
     torch.testing.assert_close(
         outputs.detection3d().transfusion_head().dense_heatmap, expected["dense_heatmap"]
     )
+    assert len(model.decode_outputs(batch, outputs).detection3d_predictions) == 1

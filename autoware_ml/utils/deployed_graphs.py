@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run a serialized TensorRT engine on named torch tensors."""
+"""Run a model's exported graphs by name, as TensorRT engines or as PyTorch modules."""
 
 from __future__ import annotations
 
@@ -20,9 +20,11 @@ from collections.abc import Mapping, Sequence
 import ctypes
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import torch
+
+from autoware_ml.utils.deploy import ExportSpec
 
 logger = logging.getLogger(__name__)
 
@@ -201,41 +203,51 @@ class TensorRTEngine:
         return outputs
 
 
-def load_engines(
-    engine_dir: str | Path, names: Sequence[str], plugin_paths: Sequence[str | Path] = ()
-) -> dict[str, TensorRTEngine]:
-    """Return the engine ``<engine_dir>/<name>.engine`` of every exported module, in order.
+class DeployedGraphs(Protocol):
+    """Exported graphs a model runs by name in place of the modules they were exported from."""
+
+    def __call__(self, name: str, tensors: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Run the graph ``name`` on the tensors, a superset of its inputs, keyed by name."""
+
+
+class TensorRTGraphs:
+    """Run every exported graph as its TensorRT engine ``<engine_dir>/<name>.engine``.
 
     Args:
-        engine_dir: Directory holding the engines.
-        names: Exported module names, in dataflow order.
+        engine_dir: Directory holding one engine per exported graph.
         plugin_paths: Plugin libraries the engines need.
     """
-    return {
-        name: TensorRTEngine(Path(engine_dir) / f"{name}.engine", plugin_paths) for name in names
-    }
 
-class TensorRTModelMixin:
-    """Load the engines of a model whose subclass runs its exported graphs on TensorRT.
+    def __init__(self, engine_dir: str | Path, plugin_paths: Sequence[str | Path] = ()) -> None:
+        self.engine_dir = Path(engine_dir)
+        self.plugin_paths = tuple(plugin_paths)
+        self.engines: dict[str, TensorRTEngine] = {}
 
-    Mixed in ahead of a model class. The subclass names its exported modules in
-    ``ENGINE_NAMES`` and overrides the forward of the stages they replace; everything else,
-    decoding and metrics included, is the model's own.
+    def __call__(self, name: str, tensors: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Run the engine of the graph ``name``, loading it on its first call."""
+        if name not in self.engines:
+            self.engines[name] = TensorRTEngine(
+                self.engine_dir / f"{name}.engine", self.plugin_paths
+            )
+        return self.engines[name](tensors)
+
+
+class TorchGraphs:
+    """Run every exported graph as the PyTorch module of its export spec.
+
+    The reference for the engines: the same graphs, inputs and serialization, without TensorRT.
 
     Args:
-        engine_dir: Directory holding one ``<name>.engine`` per entry of ``ENGINE_NAMES``.
-        plugin_paths: Plugin libraries the engines need.
-        **kwargs: Arguments of the model class.
+        specs: The model's export specs, keyed by graph name.
     """
 
-    ENGINE_NAMES: tuple[str, ...] = ()
+    def __init__(self, specs: Mapping[str, ExportSpec]) -> None:
+        self.specs = specs
 
-    def __init__(
-        self,
-        *args: Any,
-        engine_dir: str | Path,
-        plugin_paths: Sequence[str | Path] = (),
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        self.engines = load_engines(engine_dir, self.ENGINE_NAMES, plugin_paths)
+    def __call__(self, name: str, tensors: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Run the module of the graph ``name`` on its inputs, read by their export names."""
+        spec = self.specs[name]
+        outputs = spec.module(*(tensors[input_name] for input_name in spec.input_names))
+        if isinstance(outputs, torch.Tensor):
+            outputs = (outputs,)
+        return dict(zip(spec.output_names, outputs, strict=True))
