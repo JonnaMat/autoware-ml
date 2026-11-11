@@ -40,8 +40,8 @@ from autoware_ml.metrics.base import MetricSuite
 from autoware_ml.metrics.eval_mixin import MetricEvalMixin
 from autoware_ml.preprocessing.data_preprocessor import DataPreprocessor
 from autoware_ml.types.dataset import SplitType
-from autoware_ml.utils.deploy import ExportSpec
-from autoware_ml.utils.deployed_graphs import DeployedGraphs
+from autoware_ml.utils.deploy import ExportGraph, ExportSpec
+from autoware_ml.utils.deployed_graphs import DeployedGraphs, TraceRecorder
 from autoware_ml.utils.optimizer import build_lightning_optimizer_config
 
 
@@ -427,22 +427,50 @@ class ModuleBaseModel(MetricEvalMixin, L.LightningModule, ABC):
         """
         raise NotImplementedError("Model must implement build_export_spec()")
 
+    def build_export_graphs(self) -> dict[str, ExportGraph] | None:
+        """Declare the graphs :meth:`run_deployed` runs, keyed by name in dataflow order.
+
+        Returns:
+            The graphs, or ``None`` for a model exported as one ``end_to_end`` module.
+        """
+        return None
+
     def build_export_specs(
         self, multi_task_batch_inputs: ModelBatchInputs
     ) -> dict[str, ExportSpec]:
         """Build per-module deployment export specifications.
 
-        The default implementation wraps :meth:`build_export_spec` as a single
-        ``end_to_end`` module. Models with separate exportable sub-graphs
-        override this to return one spec per architectural component.
+        A model that declares :meth:`build_export_graphs` gets one spec per graph, traced on the
+        inputs the graph runs on in :meth:`run_deployed`. Otherwise the default implementation
+        wraps :meth:`build_export_spec` as a single ``end_to_end`` module. Models with
+        separate exportable sub-graphs override this to return one spec per architectural
+        component.
 
         Args:
             multi_task_batch_inputs: Example preprocessed batch used for export.
 
         Returns:
             Ordered mapping of module name to export specification.
+
+        Raises:
+            RuntimeError: If the model is in training mode, where tracing would update the
+                BatchNorm running statistics.
+            ValueError: If :meth:`run_deployed` does not run every declared graph.
         """
-        return {"end_to_end": self.build_export_spec(multi_task_batch_inputs)}
+        graphs = self.build_export_graphs()
+        if graphs is None:
+            return {"end_to_end": self.build_export_spec(multi_task_batch_inputs)}
+        if self.training:
+            raise RuntimeError(f"{type(self).__name__} export needs the model in eval mode.")
+        recorder = TraceRecorder(graphs)
+        with torch.no_grad():
+            self.run_deployed(multi_task_batch_inputs, recorder)
+        missing = [name for name in graphs if name not in recorder.args]
+        if missing:
+            raise ValueError(f"run_deployed() does not run the declared graphs {missing}.")
+        return {
+            name: graph.build_export_spec(recorder.args[name]) for name, graph in graphs.items()
+        }
 
     def outputs_from_export_tensors(self, tensors: Mapping[str, torch.Tensor]) -> ModelOutputs:
         """Rebuild the model outputs from the outputs of the exported graphs.

@@ -92,6 +92,40 @@ class ExportSpec:
             )
 
 
+@dataclass(frozen=True)
+class ExportGraph:
+    """Describe one exported graph without its trace inputs.
+
+    The model declares its graphs; :meth:`ModuleBaseModel.build_export_specs` records the inputs
+    each graph runs on in the model's deployed path and turns the graph into an
+    :class:`ExportSpec`.
+
+    Attributes:
+        module: Module instance exported to ONNX.
+        input_names: ONNX input names, in the order of the module's arguments.
+        output_names: Names of the exported output tensors, in order.
+        dynamic_axes: The axes that vary between runs, ``{tensor: {dim: name}}``.
+        supported_stages: Export stages supported by this graph.
+    """
+
+    module: torch.nn.Module
+    input_names: list[str]
+    output_names: list[str]
+    dynamic_axes: dict[str, dict[int, str]] | None = None
+    supported_stages: frozenset[str] = frozenset({"onnx", "tensorrt"})
+
+    def build_export_spec(self, args: tuple[Any, ...]) -> ExportSpec:
+        """Return the export spec that traces the graph on ``args``."""
+        return ExportSpec(
+            module=self.module,
+            args=args,
+            input_names=self.input_names,
+            output_names=self.output_names,
+            dynamic_axes=self.dynamic_axes,
+            supported_stages=self.supported_stages,
+        )
+
+
 def validate_cuda_available() -> None:
     """Ensure CUDA is available for deployment export."""
     if not torch.cuda.is_available():

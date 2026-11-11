@@ -45,7 +45,7 @@ from autoware_ml.models.detection3d.encoders.pillars.pillar_feature_net import P
 from autoware_ml.models.detection3d.encoders.pillars.point_pillar_scatter import PointPillarsScatter
 from autoware_ml.models.detection3d.heads.centerhead import CenterHead
 from autoware_ml.preprocessing.data_preprocessor import DataPreprocessor
-from autoware_ml.utils.deploy import ExportSpec
+from autoware_ml.utils.deploy import ExportGraph, ExportSpec
 from autoware_ml.utils.deployed_graphs import DeployedGraphs
 
 
@@ -249,7 +249,9 @@ class CenterPointDetection3DModel(ModuleBaseModel):
             pillar_features=pillar_features.squeeze(1),
             coords=voxels_data.coords,
             batch_indices=voxels_data.batch_indices,
-            batch_size=multi_task_batch_inputs.multi_task_gt_batch.batch_size,
+            # Sized by the batch, as in forward(): the voxel batch indices miss a sample
+            # without voxels.
+            batch_size=multi_task_batch_inputs.batch_size(),
         )
         head_outputs = graphs(
             "pts_backbone_neck_head_centerpoint", {"spatial_features": bev_features}
@@ -269,57 +271,24 @@ class CenterPointDetection3DModel(ModuleBaseModel):
         del multi_task_batch_inputs
         raise RuntimeError("CenterPoint deployment uses split modules; call build_export_specs().")
 
-    def build_export_specs(
-        self, multi_task_batch_inputs: ModelBatchInputs
-    ) -> dict[str, ExportSpec]:
-        """Build split CenterPoint deployment export specifications.
+    def build_export_graphs(self) -> dict[str, ExportGraph]:
+        """Declare the split CenterPoint deployment graphs.
 
-        The exported ABI follows the original CenterPoint deployment split:
-        decorated pillar features feed the PFN ONNX module, and dense BEV
-        spatial features feed the backbone/neck/head ONNX module. Scatter is a
-        runtime preprocessing step between the two exported modules.
-
-        Args:
-            multi_task_batch_inputs: Example preprocessed batch used to trace both modules.
+        The exported ABI follows the original CenterPoint deployment split: decorated pillar
+        features feed the PFN graph, and dense BEV spatial features feed the
+        backbone/neck/head graph. The scatter between them runs in :meth:`run_deployed`.
 
         Returns:
-            Ordered mapping of module name to export specification.
-
-        Raises:
-            RuntimeError: If the model is in training mode. Tracing the pillar encoder would
-                update its BatchNorm running statistics, so the caller puts the model in eval
-                mode first, as the deploy script does.
-            ValueError: If the batch carries no voxel data.
+            The two graphs, keyed by the artifact names the runtime loads.
         """
-        if self.training:
-            raise RuntimeError("CenterPoint export needs the model in eval mode.")
-        voxels_data = multi_task_batch_inputs.voxels_data
-        if voxels_data is None:
-            raise ValueError(
-                "ModelBatchInputs must contain voxels_data to build CenterPoint export specs."
-            )
-
-        with torch.no_grad():
-            input_features = self.pts_voxel_encoder.encode(voxels_data)
-            pillar_features = self.pts_voxel_encoder.encode_decorated(input_features).squeeze(1)
-            # Sized by the batch, as in forward(): the voxel batch indices miss a sample
-            # without voxels.
-            spatial_features = self.pts_middle_encoder(
-                pillar_features=pillar_features,
-                coords=voxels_data.coords,
-                batch_indices=voxels_data.batch_indices,
-                batch_size=multi_task_batch_inputs.batch_size(),
-            )
-
         head_wrapper = _CenterPointBackboneNeckHeadExportWrapper(
             self.pts_backbone,
             self.pts_neck,
             self.bbox_head,
         )
         return {
-            "pts_voxel_encoder_centerpoint": ExportSpec(
+            "pts_voxel_encoder_centerpoint": ExportGraph(
                 module=_CenterPointVoxelEncoderExportWrapper(self.pts_voxel_encoder),
-                args=(input_features,),
                 input_names=["input_features"],
                 output_names=["pillar_features"],
                 dynamic_axes={
@@ -327,9 +296,8 @@ class CenterPointDetection3DModel(ModuleBaseModel):
                     "pillar_features": {0: "num_voxels"},
                 },
             ),
-            "pts_backbone_neck_head_centerpoint": ExportSpec(
+            "pts_backbone_neck_head_centerpoint": ExportGraph(
                 module=head_wrapper,
-                args=(spatial_features,),
                 input_names=["spatial_features"],
                 output_names=head_wrapper.output_names,
                 dynamic_axes={

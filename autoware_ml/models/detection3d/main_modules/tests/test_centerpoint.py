@@ -337,7 +337,7 @@ class TestCenterPointDetection3DModel(unittest.TestCase):
         """
         self.centerpoint.eval()
         batch = self._build_multi_task_batch_inputs()
-        self.centerpoint.deployed_graphs = TorchGraphs(self.centerpoint.build_export_specs(batch))
+        self.centerpoint.deployed_graphs = TorchGraphs(self.centerpoint.build_export_graphs())
 
         with torch.no_grad():
             expected = self.centerpoint(batch).detection3d().center_head()

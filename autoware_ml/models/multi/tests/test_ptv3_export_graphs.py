@@ -13,6 +13,7 @@ from autoware_ml.dataclasses.models.detection3d.head_outputs import (
 from autoware_ml.models.detection3d.tests.head_output_fixtures import build_transfusion_outputs
 from autoware_ml.models.detection3d.tests.ptv3_detection3d_fixtures import build_inputs
 from autoware_ml.models.multi.tests.test_ptv3_det3d_seg3d_export import (
+    JOINT_EXPORT_OUTPUT_NAMES,
     _build_det3d_seg3d_model,
 )
 from autoware_ml.models.segmentation3d.ptv3_base import split_voxels_by_sample
@@ -87,17 +88,15 @@ def test_split_voxels_by_sample_refuses_ungrouped_or_empty_samples(
     not IS_SPCONV_AVAILABLE or not torch.cuda.is_available(),
     reason="PTv3 sparse-convolution export tests require CUDA spconv",
 )
-def test_run_deployed_matches_the_export_modules_on_their_trace_inputs() -> None:
+def test_run_deployed_split_graphs_match_the_combined_export_graph() -> None:
     model = _build_det3d_seg3d_model().cuda().eval()
     batch = build_inputs(device=torch.device("cuda"), is_training=False)
-    specs = model.build_export_specs(batch)
-    expected = {}
+    combined = model.build_export_spec(batch)
     with torch.no_grad():
-        for name in model.EXPORT_HEAD_NAMES:
-            spec = specs[name]
-            expected |= dict(zip(spec.output_names, spec.module(*spec.args), strict=True))
-
-        outputs = model.run_deployed(batch, TorchGraphs(specs))
+        expected = dict(
+            zip(JOINT_EXPORT_OUTPUT_NAMES, combined.module(*combined.args), strict=True)
+        )
+        outputs = model.run_deployed(batch, TorchGraphs(model.build_export_graphs()))
 
     assert torch.equal(outputs.segmentation3d().logits.argmax(dim=1), expected["pred_labels"])
     torch.testing.assert_close(

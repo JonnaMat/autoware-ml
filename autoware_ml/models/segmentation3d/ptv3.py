@@ -43,16 +43,15 @@ from autoware_ml.models.segmentation3d.ptv3_base import (
     SERIALIZED_POOLING_FIELDS,
     PTv3BaseModel,
     PTv3EncoderExportBase,
-    build_encoder_export_spec,
+    build_encoder_export_graph,
     build_point_feature_dynamic_axes,
-    build_ptv3_export_context,
     build_ptv3_input_dynamic_axes,
-    build_seg3d_head_export_spec,
+    build_seg3d_head_export_graph,
     prepare_ptv3_export_inputs,
     seg3d_head_outputs_from_export,
     split_block_parameters,
 )
-from autoware_ml.utils.deploy import ExportSpec
+from autoware_ml.utils.deploy import ExportGraph, ExportSpec
 
 
 class _PTv3Segmentation3DExportModule(PTv3EncoderExportBase):
@@ -263,20 +262,12 @@ class PTv3Segmentation3DModel(PTv3BaseModel):
             supported_stages=self.EXPORT_SUPPORTED_STAGES,
         )
 
-    def build_export_specs(self, batch_inputs: ModelBatchInputs) -> dict[str, ExportSpec]:
-        """Build split PTv3 segmentation ONNX export specs for encoder and head.
-
-        Args:
-            batch_inputs: Example preprocessed batch with the voxels.
-
-        Returns:
-            Export specs of the encoder and the segmentation head.
-        """
-        context = build_ptv3_export_context(self, batch_inputs)
+    def build_export_graphs(self) -> dict[str, ExportGraph]:
+        """Declare the split PTv3 segmentation graphs, the encoder and the head."""
         return {
-            "ptv3_encoder": build_encoder_export_spec(context),
-            "ptv3_seg3d_head": build_seg3d_head_export_spec(
-                context,
+            "ptv3_encoder": build_encoder_export_graph(self),
+            "ptv3_seg3d_head": build_seg3d_head_export_graph(
+                self,
                 self.seg3d_head.prepare_for_export(self.EXPORT_ORDER),
                 self.get_export_output_names(),
             ),

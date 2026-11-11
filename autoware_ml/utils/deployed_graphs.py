@@ -24,7 +24,7 @@ from typing import Any, Protocol
 
 import torch
 
-from autoware_ml.utils.deploy import ExportSpec
+from autoware_ml.utils.deploy import ExportGraph
 
 logger = logging.getLogger(__name__)
 
@@ -233,21 +233,48 @@ class TensorRTGraphs:
 
 
 class TorchGraphs:
-    """Run every exported graph as the PyTorch module of its export spec.
+    """Run every exported graph as its module in PyTorch.
 
     The reference for the engines: the same graphs, inputs and serialization, without TensorRT.
 
     Args:
-        specs: The model's export specs, keyed by graph name.
+        graphs: The model's export graphs, keyed by name.
     """
 
-    def __init__(self, specs: Mapping[str, ExportSpec]) -> None:
-        self.specs = specs
+    def __init__(self, graphs: Mapping[str, ExportGraph]) -> None:
+        self.graphs = graphs
 
     def __call__(self, name: str, tensors: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Run the module of the graph ``name`` on its inputs, read by their export names."""
-        spec = self.specs[name]
-        outputs = spec.module(*(tensors[input_name] for input_name in spec.input_names))
+        graph = self.graphs[name]
+        outputs = graph.module(*(tensors[input_name] for input_name in graph.input_names))
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
-        return dict(zip(spec.output_names, outputs, strict=True))
+        return dict(zip(graph.output_names, outputs, strict=True))
+
+
+class TraceRecorder(TorchGraphs):
+    """Run the graphs in PyTorch and keep the inputs each one ran on, to trace it for export.
+
+    Args:
+        graphs: The model's export graphs, keyed by name.
+    """
+
+    def __init__(self, graphs: Mapping[str, ExportGraph]) -> None:
+        super().__init__(graphs)
+        self.args: dict[str, tuple[torch.Tensor, ...]] = {}
+
+    def __call__(self, name: str, tensors: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Record the inputs of the graph ``name`` and run it.
+
+        Raises:
+            ValueError: If the graph already ran; export traces each graph on one call, so a
+                model that runs its graphs per sample exports from a single-sample batch.
+        """
+        if name in self.args:
+            raise ValueError(
+                f"Graph {name!r} ran twice; export traces each graph on one call, so pass a "
+                "single-sample batch."
+            )
+        self.args[name] = tuple(tensors[input_name] for input_name in self.graphs[name].input_names)
+        return super().__call__(name, tensors)

@@ -34,15 +34,12 @@ from autoware_ml.models.segmentation3d.ptv3_base import (
     SERIALIZED_POOLING_FIELDS,
     PTv3BaseModel,
     PTv3EncoderExportBase,
-    PTv3ExportContext,
-    build_encoder_export_spec,
-    build_ptv3_export_context,
+    build_encoder_export_graph,
     build_ptv3_input_dynamic_axes,
-    pick_named_tensors,
     prepare_ptv3_export_inputs,
     stage_voxel_axis_name,
 )
-from autoware_ml.utils.deploy import ExportSpec
+from autoware_ml.utils.deploy import ExportGraph, ExportSpec
 from autoware_ml.utils.point_cloud.batching import offset_to_batch
 from autoware_ml.utils.point_cloud.structures import Point
 
@@ -330,16 +327,16 @@ def det3d_head_export_dynamic_axes(stage_count: int) -> dict[str, dict[int, str]
     }
 
 
-def build_det3d_head_export_spec(
-    context: "PTv3ExportContext",
+def build_det3d_head_export_graph(
+    stage_count: int,
     bev_neck: PTv3Det3DBEVNeck,
     bbox_head: nn.Module,
     output_names: Sequence[str],
-) -> ExportSpec:
-    """Build the detection-head export spec from the two coarsest encoder stages.
+) -> ExportGraph:
+    """Declare the detection-head graph on the two coarsest encoder stages.
 
     Args:
-        context: Shared export context.
+        stage_count: Number of encoder stages.
         bev_neck: Detection BEV neck (copied internally).
         bbox_head: Export-prepared detection head copy.
         output_names: Ordered head output names.
@@ -349,13 +346,11 @@ def build_det3d_head_export_spec(
         bbox_head=bbox_head,
         output_names=output_names,
     ).eval()
-    input_names = det3d_head_export_input_names(context.stage_count)
-    return ExportSpec(
+    return ExportGraph(
         module=module,
-        args=pick_named_tensors(context.named_tensors(), input_names),
-        input_names=input_names,
+        input_names=det3d_head_export_input_names(stage_count),
         output_names=list(output_names),
-        dynamic_axes=det3d_head_export_dynamic_axes(context.stage_count),
+        dynamic_axes=det3d_head_export_dynamic_axes(stage_count),
         supported_stages=PTv3BaseModel.EXPORT_SUPPORTED_STAGES,
     )
 
@@ -610,20 +605,12 @@ class PTv3Detection3DModel(PTv3BaseModel):
             supported_stages=self.EXPORT_SUPPORTED_STAGES,
         )
 
-    def build_export_specs(self, batch_inputs: ModelBatchInputs) -> dict[str, ExportSpec]:
-        """Build split PTv3 detection ONNX export specs for encoder and detection head.
-
-        Args:
-            batch_inputs: Example preprocessed batch with the voxels.
-
-        Returns:
-            Export specs of the encoder and the detection head.
-        """
-        context = build_ptv3_export_context(self, batch_inputs)
+    def build_export_graphs(self) -> dict[str, ExportGraph]:
+        """Declare the split PTv3 detection graphs, the encoder and the detection head."""
         return {
-            "ptv3_encoder": build_encoder_export_spec(context),
-            "ptv3_det3d_head": build_det3d_head_export_spec(
-                context,
+            "ptv3_encoder": build_encoder_export_graph(self),
+            "ptv3_det3d_head": build_det3d_head_export_graph(
+                self.count_encoder_stages(),
                 self.bev_neck,
                 self.bbox_head.prepare_for_export(
                     bev_shape=self.bev_neck.bev_projector.output_shape
