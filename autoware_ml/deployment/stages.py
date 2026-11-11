@@ -89,6 +89,7 @@ class GraphStage:
         inputs: Run-state names fed to the module, in order; they are the ONNX input names.
         outputs: ONNX output names, in the module's return order.
         onnx_dynamic_axes: Axes dynamic by construction, ``{tensor: {dim: name}}``.
+        supported_stages: Export stages supported by this graph.
     """
 
     name: str
@@ -96,6 +97,7 @@ class GraphStage:
     inputs: tuple[str, ...]
     outputs: tuple[str, ...]
     onnx_dynamic_axes: Mapping[str, Mapping[int, str]] = field(default_factory=dict)
+    supported_stages: frozenset[str] = frozenset({"onnx", "tensorrt"})
 
     def __post_init__(self) -> None:
         """Refuse a tensor name listed twice: the exporter would rename it (``x`` -> ``x.1``)."""
@@ -180,6 +182,7 @@ def build_export_specs_from_stages(
             output_names=list(stage.outputs),
             dynamic_axes={name: dict(axes) for name, axes in stage.onnx_dynamic_axes.items()}
             or None,
+            supported_stages=stage.supported_stages,
         )
         for stage in graphs
     }

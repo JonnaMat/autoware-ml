@@ -53,7 +53,6 @@ from autoware_ml.models.segmentation3d.heads.ptv3 import (
 from autoware_ml.models.segmentation3d.ptv3 import PTv3Segmentation3DModel
 from autoware_ml.models.segmentation3d.ptv3_base import (
     build_ptv3_encoder_dynamic_axes,
-    build_ptv3_export_context,
     export_patch_sizes,
     prepare_ptv3_export_inputs,
     require_single_sample_export_batch,
@@ -1351,6 +1350,7 @@ def test_export_input_builders_reject_a_multi_sample_batch() -> None:
         ).multi_task_gt_batch,
         is_training=True,
     )
-    for builder in (prepare_ptv3_export_inputs, build_ptv3_export_context):
-        with pytest.raises(ValueError, match="single-sample"):
-            builder(model, double)
+    with pytest.raises(ValueError, match="single-sample"):
+        prepare_ptv3_export_inputs(model, double)
+    with pytest.raises(ValueError, match="single-sample"):
+        model.build_export_specs(double)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
+from functools import partial
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -12,6 +13,7 @@ from torch.onnx.operators import shape_as_tensor
 
 from autoware_ml.dataclasses.geometry.voxels import VoxelsData
 from autoware_ml.dataclasses.models.model_batch_inputs import ModelBatchInputs
+from autoware_ml.deployment.stages import GraphStage, RunState, Stage, TorchStage
 from autoware_ml.models.module_base_model import LogDictConfigs, ModuleBaseModel
 from autoware_ml.models.segmentation3d.encoders.ptv3 import (
     Block,
@@ -24,7 +26,6 @@ from autoware_ml.models.segmentation3d.encoders.ptv3 import (
     collect_encoder_stage_points,
 )
 from autoware_ml.models.segmentation3d.encoders.voxel import VoxelFeatureEncoder
-from autoware_ml.utils.deploy import ExportSpec
 from autoware_ml.utils.point_cloud.batching import batch_to_offset
 from autoware_ml.utils.point_cloud.structures import (
     Point,
@@ -287,6 +288,10 @@ class PTv3BaseModel(ModuleBaseModel):
         sparse_shape = torch.round(axis_extents).to(dtype=torch.long)
         return sparse_shape, serialization_depth
 
+    def count_encoder_stages(self) -> int:
+        """Return the number of encoder stages, the input level and one per pooling."""
+        return len(self.encoder.stride) + 1
+
     def _prepare_encoder_export(self) -> PointTransformerV3Encoder:
         """Return an export-ready copy of the encoder.
 
@@ -386,13 +391,19 @@ def flatten_serialized_pooling_inputs(
             encoder graph excludes ``cluster`` (it only drives head-side
             unpooling), the combined graphs export every field.
     """
-    inputs: list[torch.Tensor] = []
-    names: list[str] = []
-    for stage_index, meta in enumerate(metadata):
-        for field in field_names:
-            inputs.append(getattr(meta, field))
-            names.append(f"serialized_pooling_{stage_index}_{field}")
-    return tuple(inputs), names
+    inputs = tuple(getattr(meta, field) for meta in metadata for field in field_names)
+    return inputs, serialized_pooling_input_names(len(metadata), field_names)
+
+
+def serialized_pooling_input_names(
+    pooling_count: int, field_names: Sequence[str] = SERIALIZED_POOLING_FIELDS
+) -> list[str]:
+    """Return the input names of the flattened metadata of every pooling stage."""
+    return [
+        f"serialized_pooling_{stage_index}_{field}"
+        for stage_index in range(pooling_count)
+        for field in field_names
+    ]
 
 
 def _serialized_pooling_dynamic_axis(input_name: str) -> dict[int, str]:
@@ -656,6 +667,23 @@ class PTv3ExportInputs:
         )
         return args, [*ENCODER_EXPORT_INPUT_NAMES, *pooling_names]
 
+    def named_tensors(self) -> dict[str, torch.Tensor]:
+        """Return every tensor of the sample under the input name the exported graphs give it."""
+        tensors = {
+            "voxels": self.voxels,
+            "num_points_per_voxel": self.num_points,
+            "grid_coord": self.grid_coord,
+            "patch_order": self.patch_order,
+            "serialized_inverse": self.serialized_inverse,
+            "point_grid_coord_0": self.grid_coord,
+        }
+        for stage_index, meta in enumerate(self.pooling_metadata):
+            for field in SERIALIZED_POOLING_FIELDS:
+                tensors[f"serialized_pooling_{stage_index}_{field}"] = getattr(meta, field)
+            tensors[f"pooling_cluster_{stage_index}"] = meta.cluster
+            tensors[f"point_grid_coord_{stage_index + 1}"] = meta.grid_coord
+        return tensors
+
 
 def prepare_ptv3_export_inputs(
     model: "PTv3BaseModel", batch_inputs: ModelBatchInputs
@@ -690,92 +718,84 @@ def prepare_ptv3_export_inputs(
     )
 
 
-@dataclass(frozen=True)
-class PTv3ExportContext:
-    """Shared front half of every split PTv3 export.
+def serialize_export_inputs(
+    state: RunState, model: "PTv3BaseModel", names: Sequence[str]
+) -> dict[str, torch.Tensor]:
+    """Serialize the single-sample batch as the runtime does and return the tensors ``names``."""
+    tensors = prepare_ptv3_export_inputs(model, state.batch).named_tensors()
+    return {name: tensors[name] for name in names}
 
-    Built once per export: the serialized voxel batch, the args and input names of the
-    encoder graph, the export-ready encoder module, and its per-stage features.
+
+def build_ptv3_stages(model: "PTv3BaseModel", heads: Sequence[GraphStage]) -> tuple[Stage, ...]:
+    """Declare the PTv3 split: serialization in PyTorch, the encoder graph, then the heads.
+
+    The serialization writes exactly the tensors the graphs read and no graph writes.
+
+    Args:
+        model: The PTv3 model.
+        heads: The head graphs, reading the encoder features by name.
     """
+    graphs = (build_encoder_graph_stage(model), *heads)
+    written = {name for graph in graphs for name in graph.outputs}
+    serialized = tuple(
+        dict.fromkeys(name for graph in graphs for name in graph.inputs if name not in written)
+    )
+    serialize = TorchStage(
+        "serialize",
+        run=partial(serialize_export_inputs, model=model, names=serialized),
+        inputs=(),
+        outputs=serialized,
+    )
+    return (serialize, *graphs)
 
-    inputs: PTv3ExportInputs
-    strides: tuple[int, ...]
-    encoder_input_args: tuple[torch.Tensor, ...]
-    encoder_input_names: list[str]
-    encoder_module: nn.Module
-    stage_feats: tuple[torch.Tensor, ...]
 
-    @property
-    def stage_count(self) -> int:
-        return len(self.stage_feats)
-
-
-def build_ptv3_export_context(
-    model: "PTv3BaseModel", batch_inputs: ModelBatchInputs
-) -> PTv3ExportContext:
-    """Serialize the batch, precompute pooling metadata, and run the encoder once."""
-    inputs = prepare_ptv3_export_inputs(model, batch_inputs)
-    encoder_module = _PTv3EncoderExportModule(
+def build_encoder_graph_stage(model: "PTv3BaseModel") -> GraphStage:
+    """Declare the shared per-stage-feature encoder graph."""
+    sparse_shape, serialization_depth = model._compute_export_geometry(model.device)
+    module = _PTv3EncoderExportModule(
         encoder=model._prepare_encoder_export(),
         voxel_encoder=model.voxel_encoder,
-        sparse_shape=inputs.sparse_shape,
-        serialized_depth=inputs.serialization_depth,
+        sparse_shape=sparse_shape,
+        serialized_depth=serialization_depth,
     ).eval()
-    args, input_names = inputs.encoder_args(ENCODER_EXPORT_POOLING_FIELDS)
-    with torch.no_grad():
-        stage_feats = encoder_module(*args)
-    return PTv3ExportContext(
-        inputs=inputs,
-        strides=tuple(model.encoder.stride),
-        encoder_input_args=args,
-        encoder_input_names=input_names,
-        encoder_module=encoder_module,
-        stage_feats=tuple(stage_feats),
-    )
-
-
-def build_encoder_export_spec(context: PTv3ExportContext) -> "ExportSpec":
-    """Build the shared per-stage-feature encoder export spec."""
-    input_names = context.encoder_input_names
-    return ExportSpec(
-        module=context.encoder_module,
-        args=context.encoder_input_args,
-        input_names=input_names,
-        output_names=stage_feature_names(context.stage_count),
-        dynamic_axes=build_ptv3_encoder_dynamic_axes(input_names, context.stage_count),
+    stage_count = model.count_encoder_stages()
+    input_names = [
+        *ENCODER_EXPORT_INPUT_NAMES,
+        *serialized_pooling_input_names(stage_count - 1, ENCODER_EXPORT_POOLING_FIELDS),
+    ]
+    return GraphStage(
+        "ptv3_encoder",
+        module=module,
+        inputs=tuple(input_names),
+        outputs=tuple(stage_feature_names(stage_count)),
+        onnx_dynamic_axes=build_ptv3_encoder_dynamic_axes(input_names, stage_count),
         supported_stages=PTv3BaseModel.EXPORT_SUPPORTED_STAGES,
     )
 
 
-def build_seg3d_head_export_spec(
-    context: PTv3ExportContext, seg3d_head: nn.Module, output_names: Sequence[str]
-) -> "ExportSpec":
-    """Build the segmentation-head export spec for any decoder configuration.
+def build_seg3d_head_graph_stage(
+    model: "PTv3BaseModel", seg3d_head: nn.Module, output_names: Sequence[str]
+) -> GraphStage:
+    """Declare the segmentation-head graph for any decoder configuration.
 
     Args:
-        context: Shared export context.
+        model: The PTv3 model the head belongs to.
         seg3d_head: Export-prepared decoder head copy.
         output_names: Ordered head output names.
     """
+    stage_count = model.count_encoder_stages()
+    sparse_shape, _ = model._compute_export_geometry(model.device)
     module = _PTv3Seg3DHeadExportModule(
-        seg3d_head, context.stage_count, context.inputs.sparse_shape, context.strides
+        seg3d_head, stage_count, sparse_shape, tuple(model.encoder.stride)
     ).eval()
-    input_names = seg3d_head_export_input_names(context.stage_count, seg3d_head.dec_depths)
-    dynamic_axes = build_seg3d_head_input_dynamic_axes(context.stage_count, seg3d_head.dec_depths)
+    dynamic_axes = build_seg3d_head_input_dynamic_axes(stage_count, seg3d_head.dec_depths)
     dynamic_axes.update(build_point_feature_dynamic_axes(output_names))
-    return ExportSpec(
+    return GraphStage(
+        "ptv3_seg3d_head",
         module=module,
-        args=build_seg3d_head_export_args(
-            context.stage_feats,
-            context.inputs.pooling_metadata,
-            context.inputs.patch_order,
-            context.inputs.serialized_inverse,
-            context.inputs.grid_coord,
-            seg3d_head.dec_depths,
-        ),
-        input_names=input_names,
-        output_names=list(output_names),
-        dynamic_axes=dynamic_axes,
+        inputs=tuple(seg3d_head_export_input_names(stage_count, seg3d_head.dec_depths)),
+        outputs=tuple(output_names),
+        onnx_dynamic_axes=dynamic_axes,
         supported_stages=PTv3BaseModel.EXPORT_SUPPORTED_STAGES,
     )
 
@@ -897,30 +917,6 @@ def seg3d_head_export_input_names(stage_count: int, dec_depths: Sequence[int]) -
         prefix = "" if stage == 0 else f"serialized_pooling_{stage - 1}_"
         names += [prefix + field for field in _BLOCK_STAGE_META_FIELDS]
     return names
-
-
-def build_seg3d_head_export_args(
-    stage_feats: Sequence[torch.Tensor],
-    pooling_metadata: Sequence[SerializedPoolingMeta],
-    patch_order: torch.Tensor,
-    serialized_inverse: torch.Tensor,
-    grid_coord: torch.Tensor,
-    dec_depths: Sequence[int],
-) -> tuple[torch.Tensor, ...]:
-    """Assemble the split seg-head export args matching the input-name rule."""
-    level0 = {
-        "patch_order": patch_order,
-        "serialized_inverse": serialized_inverse,
-        "grid_coord": grid_coord,
-    }
-    args = [*stage_feats, *(meta.cluster for meta in pooling_metadata)]
-    for stage in _block_stage_indices(dec_depths):
-        if stage == 0:
-            args += [level0[field] for field in _BLOCK_STAGE_META_FIELDS]
-        else:
-            meta = pooling_metadata[stage - 1]
-            args += [getattr(meta, field) for field in _BLOCK_STAGE_META_FIELDS]
-    return tuple(args)
 
 
 def build_seg3d_head_input_dynamic_axes(

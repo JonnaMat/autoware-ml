@@ -20,6 +20,7 @@ from torch.onnx.operators import shape_as_tensor
 
 from autoware_ml.dataclasses.models.detection3d.head_outputs import Detection3DHeadOutputs
 from autoware_ml.dataclasses.models.model_batch_inputs import ModelBatchInputs
+from autoware_ml.deployment.stages import GraphStage, Stage
 from autoware_ml.dataclasses.models.model_outputs import ModelOutputs
 from autoware_ml.dataclasses.models.model_predictions import ModelPredictions
 from autoware_ml.metrics.detection3d.eval_output import detection3d_eval_output
@@ -31,9 +32,7 @@ from autoware_ml.models.segmentation3d.ptv3_base import (
     SERIALIZED_POOLING_FIELDS,
     PTv3BaseModel,
     PTv3EncoderExportBase,
-    PTv3ExportContext,
-    build_encoder_export_spec,
-    build_ptv3_export_context,
+    build_ptv3_stages,
     build_ptv3_input_dynamic_axes,
     prepare_ptv3_export_inputs,
     stage_voxel_axis_name,
@@ -326,16 +325,16 @@ def det3d_head_export_dynamic_axes(stage_count: int) -> dict[str, dict[int, str]
     }
 
 
-def build_det3d_head_export_spec(
-    context: "PTv3ExportContext",
+def build_det3d_head_graph_stage(
+    stage_count: int,
     bev_neck: PTv3Det3DBEVNeck,
     bbox_head: nn.Module,
     output_names: Sequence[str],
-) -> ExportSpec:
-    """Build the detection-head export spec from the two coarsest encoder stages.
+) -> GraphStage:
+    """Declare the detection-head graph on the two coarsest encoder stages.
 
     Args:
-        context: Shared export context.
+        stage_count: Number of encoder stages.
         bev_neck: Detection BEV neck (copied internally).
         bbox_head: Export-prepared detection head copy.
         output_names: Ordered head output names.
@@ -345,23 +344,12 @@ def build_det3d_head_export_spec(
         bbox_head=bbox_head,
         output_names=output_names,
     ).eval()
-    skip_stage = context.stage_count - 2
-    skip_grid_coord = (
-        context.inputs.grid_coord
-        if skip_stage == 0
-        else context.inputs.pooling_metadata[skip_stage - 1].grid_coord
-    )
-    return ExportSpec(
+    return GraphStage(
+        "ptv3_det3d_head",
         module=module,
-        args=(
-            context.stage_feats[skip_stage],
-            context.stage_feats[context.stage_count - 1],
-            context.inputs.pooling_metadata[skip_stage].cluster,
-            skip_grid_coord,
-        ),
-        input_names=det3d_head_export_input_names(context.stage_count),
-        output_names=list(output_names),
-        dynamic_axes=det3d_head_export_dynamic_axes(context.stage_count),
+        inputs=tuple(det3d_head_export_input_names(stage_count)),
+        outputs=tuple(output_names),
+        onnx_dynamic_axes=det3d_head_export_dynamic_axes(stage_count),
         supported_stages=PTv3BaseModel.EXPORT_SUPPORTED_STAGES,
     )
 
@@ -606,24 +594,12 @@ class PTv3Detection3DModel(PTv3BaseModel):
             supported_stages=self.EXPORT_SUPPORTED_STAGES,
         )
 
-    def build_export_specs(self, batch_inputs: ModelBatchInputs) -> dict[str, ExportSpec]:
-        """Build split PTv3 detection ONNX export specs for encoder and detection head.
-
-        Args:
-            batch_inputs: Example preprocessed batch with the voxels.
-
-        Returns:
-            Export specs of the encoder and the detection head.
-        """
-        context = build_ptv3_export_context(self, batch_inputs)
-        return {
-            "ptv3_encoder": build_encoder_export_spec(context),
-            "ptv3_det3d_head": build_det3d_head_export_spec(
-                context,
-                self.bev_neck,
-                self.bbox_head.prepare_for_export(
-                    bev_shape=self.bev_neck.bev_projector.output_shape
-                ),
-                self.export_output_names,
-            ),
-        }
+    def build_stages(self) -> tuple[Stage, ...]:
+        """Declare the split PTv3 detection deployment: serialization, encoder, detection head."""
+        head = build_det3d_head_graph_stage(
+            self.count_encoder_stages(),
+            self.bev_neck,
+            self.bbox_head.prepare_for_export(bev_shape=self.bev_neck.bev_projector.output_shape),
+            self.export_output_names,
+        )
+        return build_ptv3_stages(self, [head])

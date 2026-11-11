@@ -27,6 +27,7 @@ from typing import Any
 import torch
 
 from autoware_ml.dataclasses.models.model_batch_inputs import ModelBatchInputs
+from autoware_ml.deployment.stages import Stage
 from autoware_ml.dataclasses.models.model_outputs import ModelOutputs
 from autoware_ml.dataclasses.models.model_predictions import ModelPredictions
 from autoware_ml.dataclasses.models.segmentation3d.head_outputs import Segmentation3DHeadOutputs
@@ -43,11 +44,10 @@ from autoware_ml.models.segmentation3d.ptv3_base import (
     SERIALIZED_POOLING_FIELDS,
     PTv3BaseModel,
     PTv3EncoderExportBase,
-    build_encoder_export_spec,
+    build_ptv3_stages,
     build_point_feature_dynamic_axes,
-    build_ptv3_export_context,
     build_ptv3_input_dynamic_axes,
-    build_seg3d_head_export_spec,
+    build_seg3d_head_graph_stage,
     prepare_ptv3_export_inputs,
     split_block_parameters,
 )
@@ -256,21 +256,11 @@ class PTv3Segmentation3DModel(PTv3BaseModel):
             supported_stages=self.EXPORT_SUPPORTED_STAGES,
         )
 
-    def build_export_specs(self, batch_inputs: ModelBatchInputs) -> dict[str, ExportSpec]:
-        """Build split PTv3 segmentation ONNX export specs for encoder and head.
-
-        Args:
-            batch_inputs: Example preprocessed batch with the voxels.
-
-        Returns:
-            Export specs of the encoder and the segmentation head.
-        """
-        context = build_ptv3_export_context(self, batch_inputs)
-        return {
-            "ptv3_encoder": build_encoder_export_spec(context),
-            "ptv3_seg3d_head": build_seg3d_head_export_spec(
-                context,
-                self.seg3d_head.prepare_for_export(self.EXPORT_ORDER),
-                self.get_export_output_names(),
-            ),
-        }
+    def build_stages(self) -> tuple[Stage, ...]:
+        """Declare the split PTv3 segmentation deployment: serialization, encoder, head."""
+        head = build_seg3d_head_graph_stage(
+            self,
+            self.seg3d_head.prepare_for_export(self.EXPORT_ORDER),
+            self.get_export_output_names(),
+        )
+        return build_ptv3_stages(self, [head])

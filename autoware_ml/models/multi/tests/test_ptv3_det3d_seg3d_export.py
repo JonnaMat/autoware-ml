@@ -13,6 +13,7 @@ from autoware_ml.dataclasses.geometry.voxels import VoxelsData
 from autoware_ml.dataclasses.models.detection3d.head_outputs import Detection3DHeadOutputs
 from autoware_ml.dataclasses.models.model_outputs import ModelOutputs
 from autoware_ml.dataclasses.models.segmentation3d.head_outputs import Segmentation3DHeadOutputs
+from autoware_ml.deployment.stages import model_output_names, run_stages_in_torch
 from autoware_ml.models.module_base_model import LogDictConfigs
 from autoware_ml.models.detection3d.tests.head_output_fixtures import build_transfusion_outputs
 from autoware_ml.models.tests.batch_inputs_fixtures import (
@@ -356,3 +357,35 @@ def test_ptv3_det3d_seg3d_seg3d_logits_invariant_to_det3d_branch_pass() -> None:
         seg3d_only_logits = model.seg3d_head(point)
 
     torch.testing.assert_close(joint_logits, seg3d_only_logits)
+
+
+@pytest.mark.skipif(
+    not IS_SPCONV_AVAILABLE or not torch.cuda.is_available(),
+    reason="PTv3 sparse-convolution tests require CUDA spconv",
+)
+def test_ptv3_det3d_seg3d_stages_match_the_combined_export_graph() -> None:
+    """
+    Input: the joint model's stage graph and its single combined export graph on one sample.
+    Expected: serialize, encoder and both head graphs give the combined graph's outputs.
+    Check: the stage names, and every model output of the stages against the combined graph.
+    """
+    model = _build_det3d_seg3d_model().cuda().eval()
+    batch = build_inputs(device=torch.device("cuda"), is_training=False)
+    stages = model.build_stages()
+    combined = model.build_export_spec(batch)
+    with torch.no_grad():
+        expected = dict(
+            zip(JOINT_EXPORT_OUTPUT_NAMES, combined.module(*combined.args), strict=True)
+        )
+
+    state = run_stages_in_torch(stages, batch, torch.device("cuda"))
+
+    assert [stage.name for stage in stages] == [
+        "serialize",
+        "ptv3_encoder",
+        "ptv3_seg3d_head",
+        "ptv3_det3d_head",
+    ]
+    assert set(model_output_names(stages)) == set(JOINT_EXPORT_OUTPUT_NAMES)
+    for name in JOINT_EXPORT_OUTPUT_NAMES:
+        torch.testing.assert_close(state[name], expected[name])

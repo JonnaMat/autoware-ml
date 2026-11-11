@@ -39,12 +39,13 @@ from autoware_ml.dataclasses.batch.detection3d import Detection3DGTBatch
 from autoware_ml.dataclasses.models.detection3d.head_outputs import Detection3DHeadOutputs
 from autoware_ml.dataclasses.models.detection3d.predictions import Detection3DSamplePredictions
 from autoware_ml.dataclasses.models.model_batch_inputs import ModelBatchInputs
+from autoware_ml.deployment.stages import Stage
 from autoware_ml.dataclasses.models.model_outputs import ModelOutputs
 from autoware_ml.dataclasses.models.model_predictions import ModelPredictions
 from autoware_ml.dataclasses.models.segmentation3d.head_outputs import Segmentation3DHeadOutputs
 from autoware_ml.metrics.detection3d.eval_output import detection3d_eval_output
 from autoware_ml.models.detection3d.task_modules.partial_annotations import PartialAnnotations
-from autoware_ml.models.detection3d.ptv3 import PTv3Det3DBEVNeck, build_det3d_head_export_spec
+from autoware_ml.models.detection3d.ptv3 import PTv3Det3DBEVNeck, build_det3d_head_graph_stage
 from autoware_ml.models.segmentation3d.encoders.ptv3 import PointTransformerV3Encoder
 from autoware_ml.models.segmentation3d.encoders.voxel import VoxelFeatureEncoder
 from autoware_ml.models.segmentation3d.heads.ptv3 import (
@@ -58,11 +59,10 @@ from autoware_ml.models.segmentation3d.ptv3_base import (
     SERIALIZED_POOLING_FIELDS,
     PTv3BaseModel,
     PTv3EncoderExportBase,
-    build_encoder_export_spec,
+    build_ptv3_stages,
     build_point_feature_dynamic_axes,
-    build_ptv3_export_context,
     build_ptv3_input_dynamic_axes,
-    build_seg3d_head_export_spec,
+    build_seg3d_head_graph_stage,
     prepare_ptv3_export_inputs,
     split_block_parameters,
 )
@@ -402,40 +402,28 @@ class PTv3Det3DSeg3DModel(PTv3BaseModel):
             supported_stages=self.EXPORT_SUPPORTED_STAGES,
         )
 
-    def build_export_specs(self, batch_inputs: ModelBatchInputs) -> dict[str, ExportSpec]:
-        """Build split PTv3 det3d_seg3d ONNX export specs for encoder, seg head, and det head.
-
-        Args:
-            batch_inputs: Example preprocessed batch with the voxels.
-
-        Returns:
-            Export specs of the encoder, the segmentation head, and the detection head.
-        """
+    def build_stages(self) -> tuple[Stage, ...]:
+        """Declare the split PTv3 det3d_seg3d deployment: serialization, encoder, both heads."""
         if self.grid_size is None or self.point_cloud_range is None:
             raise ValueError(
                 "grid_size and point_cloud_range must be provided at construction time to use "
                 "export."
             )
-        context = build_ptv3_export_context(self, batch_inputs)
         det3d_output_names = [
             n for n in self.get_export_output_names() if n not in ("pred_labels", "pred_probs")
         ]
-        return {
-            "ptv3_encoder": build_encoder_export_spec(context),
-            "ptv3_seg3d_head": build_seg3d_head_export_spec(
-                context,
-                self.seg3d_head.prepare_for_export(self.EXPORT_ORDER),
-                ["pred_labels", "pred_probs"],
-            ),
-            "ptv3_det3d_head": build_det3d_head_export_spec(
-                context,
-                self.bev_neck,
-                self.bbox_head.prepare_for_export(
-                    bev_shape=self.bev_neck.bev_projector.output_shape
-                ),
-                det3d_output_names,
-            ),
-        }
+        seg3d_head = build_seg3d_head_graph_stage(
+            self,
+            self.seg3d_head.prepare_for_export(self.EXPORT_ORDER),
+            ["pred_labels", "pred_probs"],
+        )
+        det3d_head = build_det3d_head_graph_stage(
+            self.count_encoder_stages(),
+            self.bev_neck,
+            self.bbox_head.prepare_for_export(bev_shape=self.bev_neck.bev_projector.output_shape),
+            det3d_output_names,
+        )
+        return build_ptv3_stages(self, [seg3d_head, det3d_head])
 
 
 class _PTv3Det3DSeg3DExportModule(PTv3EncoderExportBase):
