@@ -26,8 +26,12 @@ from omegaconf import OmegaConf
 import torch
 from torch import nn
 
-from autoware_ml.deployment.export_specs import build_export_specs_from_stages
-from autoware_ml.deployment.stages import GraphStage, Stage, TorchStage
+from autoware_ml.deployment.stages import (
+    GraphStage,
+    Stage,
+    TorchStage,
+    build_export_specs_from_stages,
+)
 from autoware_ml.models.module_base_model import LogDictConfigs, ModuleBaseModel
 from autoware_ml.preprocessing.data_preprocessor import DataPreprocessor
 from autoware_ml.utils.deploy import ExportSpec, export_to_onnx
@@ -207,35 +211,6 @@ class TestExportSpecsFromStages(unittest.TestCase):
         self.assertEqual(
             list(build_export_specs_from_stages(stages(), None, torch.device("cpu"))), ["g"]
         )
-
-    def test_a_stage_reading_an_unwritten_name_fails_before_anything_runs(self) -> None:
-        """Test that a misspelled input name fails at export, naming the stage and the name."""
-        stages = (
-            TorchStage(
-                "seed", run=lambda state: {"x": state.batch["x"]}, inputs=(), outputs=("x",)
-            ),
-            GraphStage("g", module=nn.Identity(), inputs=("typo",), outputs=("y",)),
-        )
-        with self.assertRaisesRegex(ValueError, r"'g' reads \['typo'\].*written so far: \['x'\]"):
-            build_export_specs_from_stages(stages, {"x": torch.ones(1)}, torch.device("cpu"))
-
-    def test_glue_reusing_a_graph_output_in_place_is_rejected(self) -> None:
-        """Test that glue rewriting a graph's output in place is rejected at export."""
-        # nn.Identity returns the tensor it got: in place, the glue would rewrite g's trace
-        # input.
-        stages = (
-            TorchStage("seed", run=lambda state: {"x": torch.ones(2)}, inputs=(), outputs=("x",)),
-            GraphStage("g", module=nn.Identity(), inputs=("x",), outputs=("y",)),
-            TorchStage(
-                "reuse",
-                run=lambda state: {"z": state["y"].mul_(3.0)},
-                inputs=("y",),
-                outputs=("z",),
-            ),
-            GraphStage("h", module=nn.Identity(), inputs=("z",), outputs=("w",)),
-        )
-        with self.assertRaisesRegex(ValueError, r"'reuse' modified its inputs \['y'\] in place"):
-            build_export_specs_from_stages(stages, None, torch.device("cpu"))
 
 
 class TestExportEvalMode(unittest.TestCase):

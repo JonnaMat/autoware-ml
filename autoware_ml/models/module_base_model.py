@@ -36,8 +36,7 @@ from autoware_ml.dataclasses.models.model_predictions import ModelPredictions
 from autoware_ml.dataclasses.models.model_outputs import ModelOutputs
 from autoware_ml.dataclasses.batch.sample_batch import ModelGTBatch
 from autoware_ml.datamodule.streaming_data_module import StreamingDataModule
-from autoware_ml.deployment.export_specs import build_export_specs_from_stages
-from autoware_ml.deployment.stages import Stage
+from autoware_ml.deployment.stages import Stage, build_export_specs_from_stages
 from autoware_ml.metrics.base import MetricSuite
 from autoware_ml.metrics.eval_mixin import MetricEvalMixin
 from autoware_ml.preprocessing.data_preprocessor import DataPreprocessor
