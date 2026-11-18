@@ -1485,7 +1485,7 @@ def test_rope_export_variants_match_the_reference_rope(
     Input: two RoPE attention blocks (orders 0 and 1) run in sequence on one point, once as
     the reference path and once with the table/rotation variant, sharing weights.
     Expected: identical features, and with `rope_table_per_stage` one table on the point that
-    both blocks share.
+    both blocks share. In export mode the rotation is folded into `qkv` as for export.
     Check: max difference within 1e-5 in fp32.
     """
     torch.manual_seed(0)
@@ -1498,6 +1498,9 @@ def test_rope_export_variants_match_the_reference_rope(
         for block in blocks:
             nn.init.uniform_(block.qkv.bias, -0.5, 0.5)
             block.export_mode = export_mode
+            if export_mode:
+                # What `prepare_point_module_for_export` does; a no-op without the option.
+                block.fold_rope_rotation()
         run = Point(point)
         with torch.no_grad():
             for block in blocks:
@@ -1630,3 +1633,5 @@ def test_rope_export_variants_keep_the_encoder_export_outputs(
     gathers += 2 if table_per_stage else 0
     assert ops["variant"].count("Gather") == gathers
     assert ops["variant"].count("Gemm") == ops["reference"].count("Gemm")
+    # The folded projection is one constant weight: nothing builds it in the graph.
+    assert ops["variant"].count("Concat") <= ops["reference"].count("Concat")

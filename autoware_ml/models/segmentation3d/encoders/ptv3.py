@@ -661,6 +661,8 @@ class SerializedAttention(PointModule):
         self.rope = Point3DRoPE(channels // num_heads, rope_base) if rope_base is not None else None
         self.rope_table_per_stage = bool(rope_table_per_stage)
         self.rope_rotate_matmul = bool(rope_rotate_matmul)
+        # Set by `fold_rope_rotation` on an export copy: `qkv` already emits 5 slots.
+        self.rope_rotation_folded = False
         self.flash_attn = None
 
     @property
@@ -695,6 +697,24 @@ class SerializedAttention(PointModule):
             ]
             bias = torch.cat([bias, *parts], dim=0)
         return weight, bias
+
+    @torch.no_grad()
+    def fold_rope_rotation(self) -> None:
+        """Replace ``qkv`` by the 5-slot projection of :meth:`_rope_qkv_params`.
+
+        Meant for an export copy, like :meth:`Block.fold_cpe_bias`: the traced graph
+        then holds one constant ``(5 * channels, channels)`` weight instead of the
+        Slice/Gather/Mul/Concat that would build it from the 3-slot weight. Does
+        nothing unless ``rope_rotate_matmul`` is on.
+        """
+        if self.rope is None or not self.rope_rotate_matmul or self.rope_rotation_folded:
+            return
+        weight, bias = self._rope_qkv_params()
+        self.qkv.weight = nn.Parameter(weight.clone(), requires_grad=False)
+        if bias is not None:
+            self.qkv.bias = nn.Parameter(bias.clone(), requires_grad=False)
+        self.qkv.out_features = weight.shape[0]
+        self.rope_rotation_folded = True
 
     def _rope_cos_sin(self, point: Point, order: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the cosine/sine rows of ``order``, flattened to ``(P, head_dim)``.
@@ -824,7 +844,9 @@ class SerializedAttention(PointModule):
             inverse = unpad[point.serialized_inverse[self.order_index]]
         head_dim = channel_count // head_count
         fast_rope = self.fast_rope
-        if fast_rope and self.rope_rotate_matmul:
+        if self.rope_rotation_folded and not (fast_rope and self.rope_rotate_matmul):
+            raise ValueError("qkv holds the folded RoPE rotation; keep rope_rotate_matmul on.")
+        if fast_rope and self.rope_rotate_matmul and not self.rope_rotation_folded:
             qkv = nn.functional.linear(point.feat[order], *self._rope_qkv_params())
         else:
             qkv = self.qkv(point.feat[order])
@@ -835,7 +857,10 @@ class SerializedAttention(PointModule):
         # packed layout is handed to each branch untouched, as PTv3 expects.
         roped: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         if fast_rope:
-            cos, sin = (table.to(qkv.dtype) for table in self._rope_cos_sin(point, order))
+            cos, sin = (
+                table if table.dtype == qkv.dtype else table.to(qkv.dtype)
+                for table in self._rope_cos_sin(point, order)
+            )
         elif self.rope is not None:
             query, key, value = qkv.reshape(-1, 3, head_count, head_dim).unbind(dim=1)
             query, key = self.rope(query, key, point.grid_coord[order])
@@ -1394,6 +1419,7 @@ def prepare_point_module_for_export(module: nn.Module) -> None:
         if isinstance(child, SerializedAttention):
             child.disable_flash()
             child.export_mode = True
+            child.fold_rope_rotation()
         if isinstance(child, SerializedPooling):
             child.export_mode = True
             child.export_stage_index = pooling_stage_index
