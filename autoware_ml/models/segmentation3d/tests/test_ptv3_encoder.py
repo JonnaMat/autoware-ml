@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import inspect
 import itertools
 import math
+import textwrap
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -25,6 +27,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+import autoware_ml.models.segmentation3d.encoders.ptv3 as ptv3_encoder_module
 import autoware_ml.utils.point_cloud.structures as point_structures
 from autoware_ml.preprocessing.data_preprocessor import DataPreprocessor
 from autoware_ml.utils.point_cloud.structures import pooled_sparse_shape
@@ -1367,3 +1370,100 @@ def test_export_input_builders_reject_a_multi_sample_batch() -> None:
     for builder in (prepare_ptv3_export_inputs, build_ptv3_export_context):
         with pytest.raises(ValueError, match="single-sample"):
             builder(model, double)
+
+
+def _project_then_gather_forward():
+    """`SerializedAttention.forward` with the qkv projection applied before the gather."""
+    source = textwrap.dedent(inspect.getsource(SerializedAttention.forward))
+    gather_first = "self.qkv(point.feat[order])"
+    assert source.count(gather_first) == 1
+    namespace: dict = {}
+    # Rebuild the method from its own source, with the old line restored.
+    exec(
+        source.replace(gather_first, "self.qkv(point.feat)[order]"),
+        vars(ptv3_encoder_module),
+        namespace,
+    )
+    return namespace["forward"]
+
+
+@pytest.mark.parametrize("export_mode", [False, True])
+@pytest.mark.parametrize(("enable_rpe", "rope_base"), [(False, None), (True, None), (False, 100.0)])
+def test_serialized_attention_gathers_the_points_before_the_qkv_projection(
+    monkeypatch, export_mode: bool, enable_rpe: bool, rope_base: float | None
+) -> None:
+    """The row-wise projection commutes with the gather, padding duplicates included."""
+    torch.manual_seed(0)
+    patch_size = 4
+    attention = SerializedAttention(
+        channels=32,
+        num_heads=4,
+        patch_size=patch_size,
+        qkv_bias=True,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        order_index=1,
+        enable_rpe=enable_rpe,
+        enable_flash=False,
+        upcast_attention=False,
+        upcast_softmax=False,
+        rope_base=rope_base,
+    ).eval()
+    attention.export_mode = export_mode
+    # One sample of 9 for export; 6 + 9 in training, padded to the 6-point window.
+    counts = [9] if export_mode else [6, 9]
+    num_points = sum(counts)
+    orders = torch.cat(
+        [
+            torch.stack([torch.randperm(count), torch.randperm(count)]) + start
+            for start, count in zip([0, *itertools.accumulate(counts)], counts)
+        ],
+        dim=1,
+    )
+    point = Point(
+        feat=torch.randn(num_points, 32),
+        grid_coord=torch.randint(0, 8, (num_points, 3)),
+        offset=torch.tensor(list(itertools.accumulate(counts))),
+        serialized_order=orders,
+        serialized_inverse=torch.argsort(orders, dim=1),
+    )
+    if export_mode:
+        point["patch_order"] = build_patch_order(orders, patch_size)
+
+    def run() -> torch.Tensor:
+        with torch.no_grad():
+            return attention(Point(dict(point))).feat
+
+    gathered = run()
+    monkeypatch.setattr(SerializedAttention, "forward", _project_then_gather_forward())
+    reference = run()
+    torch.testing.assert_close(gathered, reference, rtol=0.0, atol=1e-6)
+
+
+@pytest.mark.skipif(
+    not IS_SPCONV_AVAILABLE or not torch.cuda.is_available(),
+    reason="PTv3 sparse-convolution tests require CUDA spconv",
+)
+def test_ptv3_outputs_do_not_change_with_the_qkv_gather_order(monkeypatch) -> None:
+    """Eager and export-path outputs of a jittered model match the project-then-gather ones."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    model = build_seg3d_model()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(0.1 * torch.randn_like(parameter))
+    model = model.to(device).eval()
+    batch = build_inputs(device=device)
+
+    def run() -> tuple[torch.Tensor, ...]:
+        with torch.no_grad():
+            logits = model(batch).segmentation3d().logits
+        return (logits, *build_ptv3_export_context(model, batch).stage_feats)
+
+    gathered = run()
+    monkeypatch.setattr(SerializedAttention, "forward", _project_then_gather_forward())
+    reference = run()
+    assert len(gathered) == len(reference)
+    for gathered_feat, reference_feat in zip(gathered, reference):
+        torch.testing.assert_close(gathered_feat, reference_feat, rtol=0.0, atol=1e-6)
