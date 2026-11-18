@@ -791,6 +791,7 @@ class Block(PointModule):
         enable_conv: bool = True,
         enable_attn: bool = True,
         rope_base: float | None = None,
+        entry_norm: bool = True,
     ) -> None:
         """Initialize one PTv3 attention block.
 
@@ -820,6 +821,9 @@ class Block(PointModule):
                 stages.
             rope_base: Frequency base for axis-split 3D rotary embedding, or
                 ``None`` to disable it.
+            entry_norm: Whether a block without the convolution normalizes its
+                input on entry. When false such a block passes its input
+                straight to attention, i.e. ``x + cpe(x)`` becomes ``x``.
 
         Raises:
             ValueError: Raised when the block would carry no operation at all.
@@ -842,7 +846,7 @@ class Block(PointModule):
             # No convolution to inject position, so the block normalizes on
             # entry and relies on RoPE plus serialization locality instead.
             self.cpe = None
-            self.norm0 = PointSequential(nn.LayerNorm(channels))
+            self.norm0 = PointSequential(nn.LayerNorm(channels)) if entry_norm else None
 
         if self.enable_attn:
             self.norm1 = PointSequential(nn.LayerNorm(channels))
@@ -897,7 +901,7 @@ class Block(PointModule):
             shortcut = point.feat
             point = self.cpe(point)
             point.feat = shortcut + point.feat
-        else:
+        elif self.norm0 is not None:
             point = self.norm0(point)
 
         if self.enable_attn:
@@ -1270,6 +1274,7 @@ class PointTransformerV3Encoder(PointModule):
         enc_conv: Sequence[bool] | bool = True,
         enc_attn: Sequence[bool] | bool = True,
         enc_rope_base: Sequence[float | None] | float | None = None,
+        enc_entry_norm: Sequence[bool] | bool = True,
     ) -> None:
         """Initialize the PTv3 encoder.
 
@@ -1303,6 +1308,8 @@ class PointTransformerV3Encoder(PointModule):
                 every stage.
             enc_rope_base: Rotary-embedding frequency base, either one value for
                 every stage or one per stage. ``None`` disables RoPE.
+            enc_entry_norm: Per-stage flag for the entry LayerNorm of blocks
+                whose convolution is disabled, or one flag for every stage.
         """
         super().__init__()
         self.in_channels = in_channels
@@ -1315,6 +1322,9 @@ class PointTransformerV3Encoder(PointModule):
         self.enc_conv = expand_stage_flags(enc_conv, stage_count, True, "enc_conv")
         self.enc_attn = expand_stage_flags(enc_attn, stage_count, True, "enc_attn")
         self.enc_rope_base = expand_stage_flags(enc_rope_base, stage_count, None, "enc_rope_base")
+        self.enc_entry_norm = expand_stage_flags(
+            enc_entry_norm, stage_count, True, "enc_entry_norm"
+        )
         self.embedding = Embedding(
             in_channels, enc_channels[0], kernel_size=stem_kernel_size, stem_type=stem_type
         )
@@ -1355,6 +1365,7 @@ class PointTransformerV3Encoder(PointModule):
                         enable_conv=self.enc_conv[stage_index],
                         enable_attn=self.enc_attn[stage_index],
                         rope_base=self.enc_rope_base[stage_index],
+                        entry_norm=self.enc_entry_norm[stage_index],
                     ),
                     name=f"block{block_index}",
                 )
