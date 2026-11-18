@@ -472,6 +472,22 @@ class Point3DRoPE(nn.Module):
         self.register_buffer("permutation", permutation, persistent=False)
         self.register_buffer("sign", sign, persistent=False)
 
+        # Constant per-column axis and frequency of the full-width angle row:
+        # column ``axis * chunk + i`` reads coordinate ``axis`` at ``inv_freq[i % half]``,
+        # the tail columns read axis 0 at frequency 0. ``position[:, axis] * frequency``
+        # is the same angle row ``tables`` builds with Slice/Tile/Concat, element for
+        # element (one product each; ``x * 0 = 0`` gives the tail its cos=1/sin=0). A
+        # MatMul by a (3, head_dim) matrix would be one op too, but it may run in
+        # TF32/fp16 and round the coordinates before the product.
+        column_axis = torch.zeros(self.head_dim, dtype=torch.long)
+        frequency = torch.zeros(self.head_dim)
+        for axis in range(3):
+            start = axis * self.chunk
+            column_axis[start : start + self.chunk] = axis
+            frequency[start : start + self.chunk] = inv_freq.repeat(2)
+        self.register_buffer("column_axis", column_axis, persistent=False)
+        self.register_buffer("frequency", frequency, persistent=False)
+
     def tables(self, grid_coord: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Build full-width cosine/sine tables for one set of voxel positions.
 
@@ -492,6 +508,51 @@ class Point3DRoPE(nn.Module):
             tail = angle.new_zeros((angle.shape[0], self.head_dim - self.rotated))
             angle = torch.cat([angle, tail], dim=-1)
         return angle.cos().unsqueeze(1), angle.sin().unsqueeze(1)
+
+    def stage_tables(
+        self, grid_coord: torch.Tensor, signed: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build cosine/sine tables for a whole stage at once.
+
+        Same values as :meth:`tables`, built as ``Cast -> Gather(axis=1) -> Mul ->
+        Cos/Sin`` so a stage can compute them once in voxel order and every block
+        gathers the rows of its serialization order.
+
+        Args:
+            grid_coord: Integer voxel coordinates of shape ``(N, 3)``.
+            signed: Whether the rotate-half sign is multiplied into the sine
+                table, as :meth:`forward` does. Leave it out when the sign is
+                already carried by the rotated query/key (see
+                :meth:`rotation_rows`).
+
+        Returns:
+            Cosine and sine tensors of shape ``(N, head_dim)``.
+        """
+        position = grid_coord.to(self.frequency.dtype)
+        angle = position.index_select(1, self.column_axis) * self.frequency
+        sin = angle.sin()
+        if signed:
+            sin = sin * self.sign
+        return angle.cos(), sin
+
+    def rotation_rows(self, num_heads: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the signed permutation that maps ``x`` to ``rotate_half(x)`` per head.
+
+        ``rotate_half(x)[..., j] = sign[j] * x[..., permutation[j]]`` is ``x @ R`` with a
+        constant signed permutation ``R``. Over ``num_heads`` packed heads of a linear
+        projection ``x = W f + b`` it is ``(W[index] * sign) f + b[index] * sign``, so a
+        projection can emit the rotated query/key directly. Multiplying by ``+-1`` or 0
+        is exact, so the folded rows give the same values as rotating afterwards.
+
+        Args:
+            num_heads: Number of heads packed along the projection output.
+
+        Returns:
+            Row index and row sign, each of length ``num_heads * head_dim``.
+        """
+        offset = torch.arange(num_heads, device=self.permutation.device) * self.head_dim
+        index = (offset[:, None] + self.permutation[None]).reshape(-1)
+        return index, self.sign.repeat(num_heads)
 
     def forward(
         self, query: torch.Tensor, key: torch.Tensor, grid_coord: torch.Tensor
@@ -536,6 +597,8 @@ class SerializedAttention(PointModule):
         upcast_attention: bool,
         upcast_softmax: bool,
         rope_base: float | None = None,
+        rope_table_per_stage: bool = False,
+        rope_rotate_matmul: bool = False,
     ) -> None:
         """Initialize serialized attention.
 
@@ -555,6 +618,15 @@ class SerializedAttention(PointModule):
             rope_base: Frequency base for axis-split 3D rotary embedding over
                 voxel coordinates. ``None`` disables RoPE, which is the PTv3
                 default and leaves the attention path unchanged.
+            rope_table_per_stage: Build the RoPE cosine/sine tables once per
+                stage, in voxel order, and let the block
+                gather the rows of its serialization order, instead of
+                rebuilding them from the reordered coordinates in every block.
+                Same values; only the graph changes.
+            rope_rotate_matmul: Fold rotate-half, a constant signed permutation,
+                into the qkv projection, which then emits ``q, k, v, rot(q),
+                rot(k)`` so RoPE is ``q * cos + rot(q) * sin`` with no gather
+                over the head dimension. Same values; only the graph changes.
         """
         super().__init__()
         if channels % num_heads != 0:
@@ -587,7 +659,91 @@ class SerializedAttention(PointModule):
         self.softmax = nn.Softmax(dim=-1)
         self.rpe = RelativePositionEncoding(patch_size, num_heads) if enable_rpe else None
         self.rope = Point3DRoPE(channels // num_heads, rope_base) if rope_base is not None else None
+        self.rope_table_per_stage = bool(rope_table_per_stage)
+        self.rope_rotate_matmul = bool(rope_rotate_matmul)
         self.flash_attn = None
+
+    @property
+    def fast_rope(self) -> bool:
+        """Whether RoPE runs through the table-per-stage and/or folded-rotation path."""
+        return self.rope is not None and (self.rope_table_per_stage or self.rope_rotate_matmul)
+
+    def _rope_qkv_params(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return the qkv projection extended by the rows of ``rot(q)`` and ``rot(k)``.
+
+        Output layout ``[q, k, v, rot(q), rot(k)]``, each ``channels`` wide. The extra
+        rows are sign-flipped copies of the query/key rows (see
+        :meth:`Point3DRoPE.rotation_rows`); ONNX export constant-folds them into one
+        weight, so the graph keeps a single projection Gemm.
+
+        Returns:
+            Weight of shape ``(5 * channels, channels)`` and the matching bias, or
+            ``None`` when the projection has no bias.
+        """
+        index, sign = self.rope.rotation_rows(self.num_heads)
+        weight = self.qkv.weight
+        rows = [
+            weight[part * self.channels : (part + 1) * self.channels][index] * sign[:, None]
+            for part in range(2)
+        ]
+        weight = torch.cat([weight, *rows], dim=0)
+        bias = self.qkv.bias
+        if bias is not None:
+            parts = [
+                bias[part * self.channels : (part + 1) * self.channels][index] * sign
+                for part in range(2)
+            ]
+            bias = torch.cat([bias, *parts], dim=0)
+        return weight, bias
+
+    def _rope_cos_sin(self, point: Point, order: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the cosine/sine rows of ``order``, flattened to ``(P, head_dim)``.
+
+        The sine carries the rotate-half sign unless the projection already does.
+
+        Args:
+            point: Point container of the current stage.
+            order: Token order of this block (padded serialization order).
+
+        Returns:
+            Cosine and sine of shape ``(P, head_dim)`` in fp32.
+        """
+        signed = not self.rope_rotate_matmul
+        if self.rope_table_per_stage:
+            # Cached on the stage's Point: a pooled stage is a new Point, so the
+            # table always matches the coordinates it was built from.
+            cache_key = f"rope_table_{self.rope.head_dim}_{self.rope.base}_{int(signed)}"
+            if cache_key not in point:
+                point[cache_key] = self.rope.stage_tables(point.grid_coord, signed)
+            cos, sin = point[cache_key]
+            return cos[order], sin[order]
+        cos, sin = self.rope.tables(point.grid_coord[order])
+        if signed:
+            sin = sin * self.rope.sign
+        head_dim = self.rope.head_dim
+        return cos.reshape(-1, head_dim), sin.reshape(-1, head_dim)
+
+    def _rotate(
+        self, tensors: Sequence[torch.Tensor], cos: torch.Tensor, sin: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply RoPE to the query and key slots of an unpacked projection.
+
+        Args:
+            tensors: ``(q, k, v)``, or ``(q, k, v, rot(q), rot(k))`` with the
+                rotation folded into the projection.
+            cos: Cosine broadcastable against ``q``.
+            sin: Sine broadcastable against ``q``.
+
+        Returns:
+            Rotated query, rotated key and the untouched value.
+        """
+        if self.rope_rotate_matmul:
+            query, key, value, rotated_query, rotated_key = tensors
+        else:
+            query, key, value = tensors
+            rotated_query = query.index_select(-1, self.rope.permutation)
+            rotated_key = key.index_select(-1, self.rope.permutation)
+        return query * cos + rotated_query * sin, key * cos + rotated_key * sin, value
 
     @torch.no_grad()
     def _get_padding_and_inverse(
@@ -666,20 +822,41 @@ class SerializedAttention(PointModule):
             pad, unpad, cu_seqlens = self._get_padding_and_inverse(point)
             order = point.serialized_order[self.order_index][pad]
             inverse = unpad[point.serialized_inverse[self.order_index]]
-        qkv = self.qkv(point.feat[order])
         head_dim = channel_count // head_count
+        fast_rope = self.fast_rope
+        if fast_rope and self.rope_rotate_matmul:
+            qkv = nn.functional.linear(point.feat[order], *self._rope_qkv_params())
+        else:
+            qkv = self.qkv(point.feat[order])
+        slot_count = 5 if fast_rope and self.rope_rotate_matmul else 3
 
         # With RoPE the projection has to be split before attention so queries
         # and keys can be rotated by their voxel positions; without it the
         # packed layout is handed to each branch untouched, as PTv3 expects.
         roped: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
-        if self.rope is not None:
+        if fast_rope:
+            cos, sin = (table.to(qkv.dtype) for table in self._rope_cos_sin(point, order))
+        elif self.rope is not None:
             query, key, value = qkv.reshape(-1, 3, head_count, head_dim).unbind(dim=1)
             query, key = self.rope(query, key, point.grid_coord[order])
             roped = (query, key, value)
 
         if not self.enable_flash:
-            if roped is None:
+            if fast_rope:
+                # Keep PTv3's packed Reshape -> Transpose -> Split and rotate in the
+                # (B, H, patch, D) layout the attention MatMul reads; the tables
+                # reshape to (B, 1, patch, D) without a transpose.
+                tensors = (
+                    qkv.reshape(-1, patch_size, slot_count, head_count, head_dim)
+                    .permute(2, 0, 3, 1, 4)
+                    .unbind(dim=0)
+                )
+                q, k, v = self._rotate(
+                    tensors,
+                    cos.reshape(-1, 1, patch_size, head_dim),
+                    sin.reshape(-1, 1, patch_size, head_dim),
+                )
+            elif roped is None:
                 qkv = qkv.reshape(-1, patch_size, 3, head_count, head_dim)
                 q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0)
             else:
@@ -705,6 +882,9 @@ class SerializedAttention(PointModule):
                 raise ValueError("Flash attention needs the cumulative sequence lengths")
             if self.flash_attn is None:
                 self.flash_attn = load_flash_attn_module()
+            if fast_rope:
+                tensors = qkv.reshape(-1, slot_count, head_count, head_dim).unbind(dim=1)
+                roped = self._rotate(tensors, cos.unsqueeze(1), sin.unsqueeze(1))
             packed = (
                 qkv.reshape(-1, 3, head_count, head_dim)
                 if roped is None
@@ -792,6 +972,8 @@ class Block(PointModule):
         enable_attn: bool = True,
         rope_base: float | None = None,
         entry_norm: bool = True,
+        rope_table_per_stage: bool = False,
+        rope_rotate_matmul: bool = False,
     ) -> None:
         """Initialize one PTv3 attention block.
 
@@ -824,6 +1006,8 @@ class Block(PointModule):
             entry_norm: Whether a block without the convolution normalizes its
                 input on entry. When false such a block passes its input
                 straight to attention, i.e. ``x + cpe(x)`` becomes ``x``.
+            rope_table_per_stage: See :class:`SerializedAttention`.
+            rope_rotate_matmul: See :class:`SerializedAttention`.
 
         Raises:
             ValueError: Raised when the block would carry no operation at all.
@@ -864,6 +1048,8 @@ class Block(PointModule):
                 upcast_attention=upcast_attention,
                 upcast_softmax=upcast_softmax,
                 rope_base=rope_base,
+                rope_table_per_stage=rope_table_per_stage,
+                rope_rotate_matmul=rope_rotate_matmul,
             )
             self.norm2 = PointSequential(nn.LayerNorm(channels))
             self.mlp = PointSequential(MLP(channels, mlp_ratio, proj_drop))
@@ -1275,6 +1461,8 @@ class PointTransformerV3Encoder(PointModule):
         enc_attn: Sequence[bool] | bool = True,
         enc_rope_base: Sequence[float | None] | float | None = None,
         enc_entry_norm: Sequence[bool] | bool = True,
+        rope_table_per_stage: bool = False,
+        rope_rotate_matmul: bool = False,
     ) -> None:
         """Initialize the PTv3 encoder.
 
@@ -1310,6 +1498,10 @@ class PointTransformerV3Encoder(PointModule):
                 every stage or one per stage. ``None`` disables RoPE.
             enc_entry_norm: Per-stage flag for the entry LayerNorm of blocks
                 whose convolution is disabled, or one flag for every stage.
+            rope_table_per_stage: Build the RoPE tables once per stage and gather
+                them per block. Export/latency option, same values.
+            rope_rotate_matmul: Fold RoPE's rotate-half into the qkv projection.
+                Export/latency option, same values.
         """
         super().__init__()
         self.in_channels = in_channels
@@ -1366,6 +1558,8 @@ class PointTransformerV3Encoder(PointModule):
                         enable_attn=self.enc_attn[stage_index],
                         rope_base=self.enc_rope_base[stage_index],
                         entry_norm=self.enc_entry_norm[stage_index],
+                        rope_table_per_stage=rope_table_per_stage,
+                        rope_rotate_matmul=rope_rotate_matmul,
                     ),
                     name=f"block{block_index}",
                 )

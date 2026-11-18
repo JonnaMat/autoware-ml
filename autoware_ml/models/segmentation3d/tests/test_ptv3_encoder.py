@@ -21,8 +21,10 @@ import math
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import onnx
 import pytest
 import torch
+from omegaconf import OmegaConf
 import torch.nn as nn
 
 import autoware_ml.utils.point_cloud.structures as point_structures
@@ -75,6 +77,7 @@ from autoware_ml.models.segmentation3d.ptv3_base import (
     validate_serialization_geometry,
 )
 from autoware_ml.ops.spconv.availability import IS_SPCONV_AVAILABLE
+from autoware_ml.utils.deploy import export_to_onnx
 
 
 def test_serialized_attention_requires_supported_flash_configuration() -> None:
@@ -1424,3 +1427,206 @@ def test_export_folds_the_cpe_bias_into_the_linear_layer(monkeypatch) -> None:
         assert all(next(block.cpe.children()).bias is None for block in blocks), name
     for key, value in model.state_dict().items():
         assert torch.equal(value, state[key]), key
+
+
+# RoPE export variants: `rope_table_per_stage` and `rope_rotate_matmul` only change the graph, so
+# each must reproduce the reference RoPE path (per-block tables, gather-based rotate-half).
+ROPE_VARIANTS = [
+    pytest.param(True, False, id="table_per_stage"),
+    pytest.param(False, True, id="rotate_matmul"),
+    pytest.param(True, True, id="table_per_stage+rotate_matmul"),
+]
+
+
+def _build_rope_attention(
+    order_index: int, table_per_stage: bool = False, rotate_matmul: bool = False
+) -> SerializedAttention:
+    """Return a non-flash RoPE attention whose head_dim (16) leaves an unrotated tail."""
+    return SerializedAttention(
+        channels=32,
+        num_heads=2,
+        patch_size=4,
+        qkv_bias=True,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        order_index=order_index,
+        enable_rpe=False,
+        enable_flash=False,
+        upcast_attention=False,
+        upcast_softmax=False,
+        rope_base=100.0,
+        rope_table_per_stage=table_per_stage,
+        rope_rotate_matmul=rotate_matmul,
+    ).eval()
+
+
+def _rope_point(num_points: int, patch_size: int, export_mode: bool) -> Point:
+    """Return one sample with random features, coordinates and two serialization orders."""
+    orders = torch.stack([torch.randperm(num_points), torch.randperm(num_points)])
+    point = Point(
+        feat=torch.randn(num_points, 32),
+        grid_coord=torch.randint(0, 300, (num_points, 3), dtype=torch.int32),
+        offset=torch.tensor([num_points]),
+        serialized_order=orders,
+        serialized_inverse=torch.argsort(orders, dim=1),
+    )
+    if export_mode:
+        point["patch_order"] = build_patch_order(orders, patch_size)
+    return point
+
+
+@pytest.mark.parametrize("export_mode", [True, False])
+@pytest.mark.parametrize(("table_per_stage", "rotate_matmul"), ROPE_VARIANTS)
+def test_rope_export_variants_match_the_reference_rope(
+    table_per_stage: bool, rotate_matmul: bool, export_mode: bool
+) -> None:
+    """
+    Input: two RoPE attention blocks (orders 0 and 1) run in sequence on one point, once as
+    the reference path and once with the table/rotation variant, sharing weights.
+    Expected: identical features, and with `rope_table_per_stage` one table on the point that
+    both blocks share.
+    Check: max difference within 1e-5 in fp32.
+    """
+    torch.manual_seed(0)
+    num_points = 10
+    point = _rope_point(num_points, 4, export_mode)
+    outputs = []
+    for variant in ((False, False), (table_per_stage, rotate_matmul)):
+        torch.manual_seed(1)
+        blocks = [_build_rope_attention(index, *variant) for index in range(2)]
+        for block in blocks:
+            nn.init.uniform_(block.qkv.bias, -0.5, 0.5)
+            block.export_mode = export_mode
+        run = Point(point)
+        with torch.no_grad():
+            for block in blocks:
+                run = block(run)
+        outputs.append(run.feat)
+        tables = [key for key in run if key.startswith("rope_table_")]
+        assert len(tables) == (1 if variant[0] else 0)
+    torch.testing.assert_close(outputs[1], outputs[0], atol=1e-5, rtol=1e-5)
+
+
+def test_rope_rotate_matmul_rows_are_rotate_half() -> None:
+    """The folded projection rows give exactly `rotate_half` of the query and key."""
+    torch.manual_seed(0)
+    attention = _build_rope_attention(0, rotate_matmul=True)
+    nn.init.uniform_(attention.qkv.bias, -0.5, 0.5)
+    feat = torch.randn(7, 32)
+    weight, bias = attention._rope_qkv_params()
+    assert weight.shape == (5 * 32, 32)
+    with torch.no_grad():
+        extended = nn.functional.linear(feat, weight, bias).reshape(7, 5, 2, 16)
+        plain = attention.qkv(feat).reshape(7, 3, 2, 16)
+    rope = attention.rope
+    expected = plain[:, :2].index_select(-1, rope.permutation) * rope.sign
+    torch.testing.assert_close(extended[:, :3], plain, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(extended[:, 3:], expected, atol=1e-6, rtol=1e-6)
+
+
+def test_rope_stage_tables_match_the_per_block_tables() -> None:
+    """`stage_tables` (Gather + Mul) equals `tables` (Slice/Tile/Concat) bit for bit."""
+    rope = _build_rope_attention(0).rope
+    grid_coord = torch.randint(0, 2000, (64, 3), dtype=torch.int32)
+    cos, sin = rope.tables(grid_coord)
+    stage_cos, stage_sin = rope.stage_tables(grid_coord, signed=True)
+    assert torch.equal(stage_cos, cos.squeeze(1))
+    assert torch.equal(stage_sin, (sin * rope.sign).squeeze(1))
+
+
+def _build_rope_seg3d_model() -> PTv3Segmentation3DModel:
+    """Return the small test model with the CPE removed and RoPE in every block."""
+    encoder = PointTransformerV3Encoder(
+        in_channels=SweepSplitVoxelFeatureEncoder.out_channels,
+        order=("z", "z-trans"),
+        stride=(2,),
+        enc_depths=(2, 2),
+        enc_channels=(16, 32),
+        enc_num_head=(1, 2),
+        enc_patch_size=(4, 4),
+        mlp_ratio=2.0,
+        qkv_bias=True,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        drop_path=0.0,
+        pre_norm=True,
+        shuffle_orders=False,
+        enable_rpe=False,
+        enable_flash=False,
+        upcast_attention=False,
+        upcast_softmax=False,
+        enc_conv=False,
+        enc_entry_norm=False,
+        enc_rope_base=100.0,
+    )
+    return PTv3Segmentation3DModel(
+        log_dict_configs=LogDictConfigs(prog_bar=False),
+        data_preprocessor=DataPreprocessor(preprocessor_modules=[]),
+        encoder=encoder,
+        voxel_encoder=SweepSplitVoxelFeatureEncoder(),
+        seg3d_head=build_seg3d_head(),
+        grid_size=1.0,
+        point_cloud_range=[0.0, 0.0, -2.0, 8.0, 8.0, 2.0],
+    )
+
+
+def _set_rope_variant(module: nn.Module, table_per_stage: bool, rotate_matmul: bool) -> None:
+    for child in module.modules():
+        if isinstance(child, SerializedAttention) and child.rope is not None:
+            child.rope_table_per_stage = table_per_stage
+            child.rope_rotate_matmul = rotate_matmul
+
+
+@pytest.mark.skipif(
+    not IS_SPCONV_AVAILABLE or not torch.cuda.is_available(),
+    reason="PTv3 sparse-convolution export tests require CUDA spconv",
+)
+@pytest.mark.parametrize(("table_per_stage", "rotate_matmul"), ROPE_VARIANTS)
+def test_rope_export_variants_keep_the_encoder_export_outputs(
+    table_per_stage: bool, rotate_matmul: bool, tmp_path
+) -> None:
+    """
+    Input: a CPE-free RoPE encoder; its export module run as the reference RoPE path and
+    as the variant, and the variant exported to ONNX.
+    Expected: equal stage outputs; with `rope_table_per_stage` one Cos/Sin per stage instead
+    of one per block; with `rope_rotate_matmul` no Gather over the head dimension and a qkv
+    projection five channel blocks wide.
+    Check: outputs within 1e-5, ONNX op counts.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    model = _build_rope_seg3d_model()
+    _jitter_affine_parameters(model)
+    model = model.to(device).eval()
+    batch = build_inputs(device=device)
+
+    reference = model.build_export_specs(batch)["ptv3_encoder"]
+    _set_rope_variant(model, table_per_stage, rotate_matmul)
+    variant = model.build_export_specs(batch)["ptv3_encoder"]
+    with torch.no_grad():
+        reference_outputs = reference.module(*reference.args)
+        variant_outputs = variant.module(*variant.args)
+    for variant_output, reference_output in zip(variant_outputs, reference_outputs, strict=True):
+        if variant_output.is_floating_point():
+            torch.testing.assert_close(variant_output, reference_output, rtol=1e-5, atol=1e-5)
+
+    onnx_cfg = OmegaConf.create({"opset_version": 17, "dynamo": False})
+    ops = {}
+    for tag, spec in (("reference", reference), ("variant", variant)):
+        path = tmp_path / f"{tag}.onnx"
+        export_to_onnx(spec, onnx_cfg, path)
+        ops[tag] = [node.op_type for node in onnx.load(str(path)).graph.node]
+    block_count = 4
+    # Reference: one Cos/Sin per block. Table per stage: one per stage.
+    assert ops["reference"].count("Cos") == block_count
+    assert ops["variant"].count("Cos") == (2 if table_per_stage else block_count)
+    # The rotate-half Gathers (q and k) go away with the folded rotation. The per-stage table
+    # gathers cos and sin in place of grid_coord and of the shape element the per-block
+    # table read, so its Gather count per block is unchanged; each of the 2 stages adds one
+    # Gather that spreads the coordinates over the head dimension.
+    gathers = ops["reference"].count("Gather") - (2 * block_count if rotate_matmul else 0)
+    gathers += 2 if table_per_stage else 0
+    assert ops["variant"].count("Gather") == gathers
+    assert ops["variant"].count("Gemm") == ops["reference"].count("Gemm")
