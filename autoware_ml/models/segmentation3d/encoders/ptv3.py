@@ -1199,11 +1199,13 @@ def prepare_point_module_for_export(module: nn.Module) -> None:
 
 
 @torch.no_grad()
-def fold_cpe_bias(module: nn.Module) -> None:
-    """Fold the bias of every positional-encoding convolution into the linear layer after it.
+def fold_cpe_linear(module: nn.Module) -> None:
+    """Fold the linear layer of every positional encoding into the convolution before it.
 
-    ``Linear(W1, b1)(conv(x) + b0)`` equals ``Linear(W1, b1 + W1 b0)(conv(x))``, so the
-    convolution runs without a bias. Meant for an export copy, the parameters change in place.
+    The submanifold convolution is linear in its weights, so ``Linear(W1, b1)(conv_W(x) + b0)``
+    equals ``conv_{W1 W}(x) + W1 b0 + b1``, with ``W1`` applied along the output channels of
+    the KRSC weight ``[C_out, kd, kh, kw, C_in]``. The encoding then runs as the convolution
+    followed by its layer norm. Meant for an export copy, the parameters change in place.
 
     Args:
         module: Module hierarchy whose :class:`Block` children are folded in place.
@@ -1211,12 +1213,25 @@ def fold_cpe_bias(module: nn.Module) -> None:
     for block in module.modules():
         if not isinstance(block, Block) or block.cpe is None:
             continue
-        conv, linear, _ = block.cpe.children()
-        if conv.bias is None:
+        (_, conv), (linear_name, linear), _ = block.cpe.named_children()
+        if not isinstance(linear, nn.Linear):
             continue
-        bias = linear.bias.double() + linear.weight.double() @ conv.bias.double()
-        linear.bias.copy_(bias.to(linear.bias.dtype))
-        conv.bias = None
+        weight = conv.weight.double()
+        if linear.in_features != weight.shape[0] or linear.out_features != weight.shape[0]:
+            raise ValueError("Folding a positional-encoding linear layer needs a square layer.")
+        linear_weight = linear.weight.double()
+        folded = (linear_weight @ weight.reshape(weight.shape[0], -1)).reshape(weight.shape)
+        bias = (
+            torch.zeros_like(linear_weight[:, 0]) if linear.bias is None else linear.bias.double()
+        )
+        if conv.bias is not None:
+            bias = bias + linear_weight @ conv.bias.double()
+        conv.weight.copy_(folded.to(conv.weight.dtype))
+        if conv.bias is None:
+            conv.bias = nn.Parameter(bias.to(conv.weight.dtype))
+        else:
+            conv.bias.copy_(bias.to(conv.bias.dtype))
+        block.cpe.add_module(linear_name, nn.Identity())
 
 
 @torch.no_grad()
@@ -1502,7 +1517,7 @@ class PointTransformerV3Encoder(PointModule):
         export_encoder.set_serialization_order(order)
         export_encoder.shuffle_orders = False
         prepare_point_module_for_export(export_encoder)
-        fold_cpe_bias(export_encoder)
+        fold_cpe_linear(export_encoder)
         fold_ln_affine(export_encoder)
         fold_pool_bn(export_encoder)
         fold_stem_bn(export_encoder)
