@@ -1423,3 +1423,18 @@ def test_export_folds_the_cpe_bias_into_the_linear_layer(monkeypatch) -> None:
     blocks = [module for module in export_module.modules() if isinstance(module, Block)]
     assert blocks
     assert all(next(block.cpe.children()).bias is None for block in blocks)
+
+
+@pytest.mark.skipif(
+    not IS_SPCONV_AVAILABLE or not torch.cuda.is_available(),
+    reason="PTv3 sparse-convolution export tests require CUDA spconv",
+)
+def test_export_folds_the_layer_norm_affine_into_the_linear_layers(monkeypatch) -> None:
+    export_module = _assert_export_fold_keeps_the_encoder_output(monkeypatch, "fold_ln_affine")
+    blocks = [module for module in export_module.modules() if isinstance(module, Block)]
+    assert blocks
+    for block in blocks:
+        for norm in (block.norm1, block.norm2):
+            layer_norm = next(norm.children())
+            assert torch.equal(layer_norm.weight, torch.ones_like(layer_norm.weight))
+            assert torch.equal(layer_norm.bias, torch.zeros_like(layer_norm.bias))
