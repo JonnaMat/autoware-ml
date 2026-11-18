@@ -47,6 +47,7 @@ from autoware_ml.models.detection3d.tests.ptv3_detection3d_fixtures import (
 )
 from autoware_ml.models.segmentation3d.encoders.ptv3 import (
     Block,
+    Embedding,
     Point,
     PointSequential,
     PointTransformerV3Encoder,
@@ -1462,3 +1463,15 @@ def test_fold_pool_bn_rejects_a_scale_that_is_not_positive() -> None:
         norm.weight[3] = -0.5
     with pytest.raises(ValueError, match="positive scales"):
         fold_pool_bn(pooling)
+
+
+@pytest.mark.skipif(
+    not IS_SPCONV_AVAILABLE or not torch.cuda.is_available(),
+    reason="PTv3 sparse-convolution export tests require CUDA spconv",
+)
+def test_export_folds_the_stem_batch_norm_into_the_linear_stem(monkeypatch) -> None:
+    export_module = _assert_export_fold_keeps_the_encoder_output(monkeypatch, "fold_stem_bn")
+    embeddings = [module for module in export_module.modules() if isinstance(module, Embedding)]
+    assert embeddings
+    for embedding in embeddings:
+        assert not any(isinstance(module, nn.BatchNorm1d) for module in embedding.modules())
