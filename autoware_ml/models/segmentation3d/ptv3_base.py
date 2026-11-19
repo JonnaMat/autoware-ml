@@ -270,7 +270,13 @@ class PTv3BaseModel(ModuleBaseModel):
                 "'max_voxels' and 'eval_max_voxels' of the data preprocessing so every voxel "
                 "is kept."
             )
-        return self.encoder(self.build_encoder_inputs(voxels, num_points, voxel_coords))
+        from autoware_ml.models.segmentation3d import encoder_error_hook  # RDDR-1486 calibration
+
+        if encoder_error_hook.active():
+            encoder_error_hook.install(self.encoder)
+        return encoder_error_hook.apply(
+            self.encoder(self.build_encoder_inputs(voxels, num_points, voxel_coords))
+        )
 
     def _compute_export_geometry(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute sparse shape and serialization depth for export.
