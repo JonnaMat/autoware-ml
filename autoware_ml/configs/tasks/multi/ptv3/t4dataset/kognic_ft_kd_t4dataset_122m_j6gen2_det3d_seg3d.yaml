@@ -1,0 +1,17 @@
+# @package _global_
+# The Kognic 10k finetune (kognic_ft_v020_t4dataset_122m_j6gen2_det3d_seg3d, unchanged: data, LR groups,
+# schedule, metrics) plus knowledge distillation from a frozen teacher with the ptv3_det3d_seg3d group
+# (seg3d logits KL T=2 weight 1, dense det3d heatmap sigmoid soft target weight 1, bev_neck features
+# normalized MSE weight 0.1; train only, so val/loss stays the ground-truth loss), RDDR-1486.
+# For pruned PTv3 v0.3.0 students with the unpruned v0.3.0 best as the teacher:
+#   autoware-ml train --config-name multi/ptv3/t4dataset/kognic_ft_kd_t4dataset_122m_j6gen2_det3d_seg3d \
+#     --weights <pruned init.ckpt> <architecture overrides of the student> ft_epochs=<N> \
+#     teacher_weights=[<teacher dir>/checkpoints/best.ckpt] +model.distillation.teacher.config=<teacher dir>/config/resolved.yaml
+# The teacher is rebuilt from its own resolved config (the student's architecture overrides do not reach it).
+# Test and deploy use the plain kognic leaf with the student's overrides: the checkpoints hold student keys only.
+defaults:
+  - kognic_ft_v020_t4dataset_122m_j6gen2_det3d_seg3d
+  - /distillation: ptv3_det3d_seg3d
+  - _self_
+
+experiment_name: kognic_ft_kd_t4dataset_122m_j6gen2_det3d_seg3d
