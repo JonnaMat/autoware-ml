@@ -1,0 +1,16 @@
+_target_: autoware_ml.databases.t4dataset.t4scenarios.T4Scenarios
+_convert_: all
+
+# Scenario root: the FY26H1 delivery list with every scene at version 2, the version the cluster
+# copy of db_j6gen2_det3d_seg3d_v1 holds (the external list still says version 1). Copied from
+# max_schmeller's private list (md5 ccd34e04, 316/40/38 scenes: it leaves out train scene
+# 5b1bee02, 200 samples with only 20 semantic masks) into this checkout (RDDR-1486, gw only).
+scenario_root_path: /pool/workspaces/jonna_matthiesen/src/autoware-ml-3a5ba6c-kognic/kognic_scenarios/t4dataset/detection3d_segmentation3d
+
+dataset_params:
+  # Every sample of the delivery is an annotated keyframe (20 per 1 Hz scene, 200 per 10 Hz scene,
+  # the sweeps are separate sample_data), so the samples are not subsampled.
+  - _target_: autoware_ml.databases.scenarios.DatasetParams
+    _convert_: all
+    dataset_name: db_j6gen2_det3d_seg3d_v1
+    sample_steps: 1

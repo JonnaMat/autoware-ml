@@ -1,0 +1,76 @@
+# @package _global_
+# Short finetune of the PTv3 v0.2.0 multi-task model on the Kognic 10k delivery
+# (db_j6gen2_det3d_seg3d_v1, version 2 packs, FY26H1, 316/40/38 scenes), RDDR-1486.
+# Adapted from max_schmeller's teacher_ptv3_v020_t4dataset_122m_j6gen2_det3d_seg3d leaf (same
+# database, taxonomy, ego, batch) with the learning-rate groups of the v0.2.0 stage-3 config
+# (multi/ptv3/t4dataset/voxel012_b8_24e_t4dataset_122m_pseudo_10hz_500k: default 1.5e-4,
+# encoder blocks 1e-5, encoder rest 2.5e-5, seg3d head 5e-5, cyclic cosine peak 2x, min 1e-4x,
+# drop_path 0.3). The scheduler steps per epoch: no warmup, cosine decay over ft_epochs.
+#   autoware-ml train --config-name multi/ptv3/t4dataset/kognic_ft_v020_t4dataset_122m_j6gen2_det3d_seg3d \
+#     --weights <v0.2.0 best.ckpt or a pruned copy> ft_epochs=<N> [architecture overrides]
+# Metrics: whole-scene components only (no lanelet-map slices; the Kognic scenes have no
+# region filters to score), so val/test report det3d mAP and seg3d mIoU cheaply.
+defaults:
+  - base_voxel012_122m
+  - /database@database: t4dataset/t4dataset_j6gen2_det3d_seg3d_fy26h1
+  - override /database/t4dataset/taxonomy@taxonomy: default_coarse
+  - override /ego@ego: default_t4dataset
+  - _self_
+
+# Schedule length in epochs (one epoch = the whole train split once).
+ft_epochs: 6
+
+batch_size: 8
+num_workers: 8
+experiment_group_name: ptv3_det3d_seg3d/${database.version}/kognic_ft
+experiment_name: kognic_ft_v020_t4dataset_122m_j6gen2_det3d_seg3d
+
+# Finetunes start from given weights.
+weights: ???
+
+optimizer:
+  lr: 0.00015
+
+model:
+  optimizer_group_overrides:
+    encoder_block:
+      lr: 0.00001
+    encoder_default:
+      lr: 0.000025
+    seg3d_head:
+      lr: 0.00005
+  scheduler:
+    warmup_epochs: 0
+    decay_epochs: ${ft_epochs}
+    max_lr_factor: 2.0
+
+trainer:
+  max_epochs: ${ft_epochs}
+
+callbacks:
+  dynamic_validation:
+    epoch_intervals: [[0, 1]]
+  early_stopping: null
+  model_checkpoint_last:
+    save_on_train_epoch_end: true
+
+metric_params:
+  detection3d:
+    components:
+      detection3d_components:
+        - { _target_: autoware_ml.metrics.detection3d.frame_count.FrameCount, stages: [val, test] }
+        - { _target_: autoware_ml.metrics.detection3d.box_counts.BoxCounts, stages: [val, test] }
+        - { _target_: autoware_ml.metrics.detection3d.mean_ap.MeanAP, stages: [val, test] }
+      occlusion_split_components:
+        - { _target_: autoware_ml.metrics.detection3d.mean_ap.MeanAP, stages: [test] }
+  segmentation3d:
+    components:
+      confusion_components:
+        - { _target_: autoware_ml.metrics.segmentation3d.frame_count.FrameCount, stages: [val, test] }
+        - { _target_: autoware_ml.metrics.segmentation3d.iou.IoU, stages: [val, test] }
+        - { _target_: autoware_ml.metrics.segmentation3d.accuracy.Accuracy, stages: [val, test] }
+      point_components:
+        - { _target_: autoware_ml.metrics.segmentation3d.frame_count.FrameCount, stages: [test] }
+
+# The joint det3d/seg3d coverage suite scores per map slice only besides the whole scene; off.
+det3d_seg3d_metrics: []

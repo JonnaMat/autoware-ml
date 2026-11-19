@@ -1,0 +1,16 @@
+# Official FY26H1 Kognic J6 gen2 delivery (db_j6gen2_det3d_seg3d_v1: 395 scenes, drive-level
+# 80/10/10 split, RDDR-1166 / RDDR-1132) with boxes and semantic masks. The cluster copy holds
+# every scene as version 2 (sensing-filtered), so the scene list is a private copy of the
+# delivery list with the version bumped; see the scenarios config.
+defaults:
+  - t4dataset/t4dataset_common@_here_
+  - t4dataset/scenarios@scenarios.db_j6gen2_det3d_seg3d_v1: detection3d_segmentation3d/db_j6gen2_det3d_seg3d_fy26h1
+  - override t4dataset/taxonomy/vocabulary@vocabulary: full_detection3d
+  - override t4dataset/box3d_pipelines@box3d_pipelines: trailer_merge_box3d_pipelines
+  - _self_
+
+version: T4Dataset-j6gen2_det3d_seg3d_fy26h1-v1.0.0
+cache_path: ${cache_root_path}/detection3d_segmentation3d_fy26h1/
+# The version-2 packs store x, y, z, intensity, channel (the pre-delivery packs store 7 columns);
+# the models read dims 0-3 only.
+lidar_pointcloud_num_features: 5
