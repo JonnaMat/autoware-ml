@@ -1,0 +1,26 @@
+# @package _global_
+# Scores the v0.2.0 teacher on the official FY26H1 delivery val split (its stage-3 joint source
+# contains 37 of these val/test scenes, so this reference is contaminated).
+defaults:
+  - /tasks/multi/ptv3/t4dataset/base_voxel012_122m
+  - /database@database: t4dataset/t4dataset_j6gen2_det3d_seg3d_fy26h1
+  - override /database/t4dataset/taxonomy@taxonomy: default_coarse
+  - override /ego@ego: default_t4dataset
+  - _self_
+
+batch_size: 8
+num_workers: 8
+experiment_group_name: ptv3_det3d_seg3d/${database.version}/kd_benchmark
+experiment_name: teacher_ptv3_v020_t4dataset_122m_j6gen2_det3d_seg3d
+
+trainer:
+  max_epochs: 30
+
+model:
+  scheduler:
+    warmup_epochs: 4
+    decay_epochs: 26
+
+callbacks:
+  dynamic_validation:
+    epoch_intervals: [[0, 1]]
