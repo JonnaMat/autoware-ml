@@ -445,7 +445,9 @@ def segmentation3d_eval_output(
         coord=points[scored, :3],
         pred_labels=point_logits.argmax(dim=1),
         target_labels=_point_labels(label_batch).long()[scored],
-        scores=torch.softmax(point_logits, dim=1),
+        # float32: under bf16-mixed the logits are bf16 and a bf16 softmax misses the point-cloud
+        # suite's row-sum check (|sum - 1| <= 1e-3) by up to 3e-3
+        scores=torch.softmax(point_logits.float(), dim=1),
         frame_ids=point_batch.batch_indices.long()[scored],
         num_frames=point_batch.batch_size,
         batch_inputs=batch_inputs,
