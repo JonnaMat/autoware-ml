@@ -63,6 +63,7 @@ POINT_CLOUD_RANGE = [0.0, 0.0, -2.0, 8.0, 8.0, 2.0]
 
 def build_ptv3_encoder(
     in_channels: int = SweepSplitVoxelFeatureEncoder.out_channels,
+    enc_norm: str = "ln",
 ) -> PointTransformerV3Encoder:
     """Return a small PTv3 encoder suitable for unit tests."""
     return PointTransformerV3Encoder(
@@ -85,6 +86,7 @@ def build_ptv3_encoder(
         enable_flash=False,
         upcast_attention=False,
         upcast_softmax=False,
+        enc_norm=enc_norm,
     )
 
 
@@ -119,12 +121,13 @@ def build_seg3d_head(
 def build_seg3d_model(
     point_cloud_range: Sequence[float] = POINT_CLOUD_RANGE,
     voxel_encoder_type: type[VoxelFeatureEncoder] = SweepSplitVoxelFeatureEncoder,
+    enc_norm: str = "ln",
 ) -> PTv3Segmentation3DModel:
     """Return a small PTv3 segmentation model for tests."""
     return PTv3Segmentation3DModel(
         log_dict_configs=LogDictConfigs(prog_bar=False),
         data_preprocessor=DataPreprocessor(preprocessor_modules=[]),
-        encoder=build_ptv3_encoder(voxel_encoder_type.out_channels),
+        encoder=build_ptv3_encoder(voxel_encoder_type.out_channels, enc_norm=enc_norm),
         voxel_encoder=voxel_encoder_type(),
         seg3d_head=build_seg3d_head(),
         optimizer=lambda params: torch.optim.AdamW(params, lr=1e-3),

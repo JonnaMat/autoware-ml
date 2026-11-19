@@ -740,6 +740,71 @@ class SerializedAttention(PointModule):
         return point
 
 
+BLOCK_NORMS = ("ln", "bn")
+
+
+class PointBatchNorm(nn.BatchNorm1d):
+    """BatchNorm over the point dimension of ``[num_points, channels]`` features.
+
+    Training normalizes each channel with the statistics of every point in the batch; evaluation
+    uses the running statistics, so the layer is a per-channel affine that the export folds into
+    the neighbouring linear layer (see :meth:`Block.fold_batch_norms`). Computed in fp32 under
+    CUDA autocast, as ``layer_norm`` is.
+    """
+
+    def forward(
+        self, input: Float[torch.Tensor, "num_points channels"]
+    ) -> Float[torch.Tensor, "num_points channels"]:
+        """Normalize the features, in fp32 when CUDA autocast is enabled.
+
+        Args:
+            input: Point features.
+
+        Returns:
+            Normalized features.
+        """
+        if input.is_cuda and torch.is_autocast_enabled("cuda"):
+            with torch.autocast("cuda", enabled=False):
+                return super().forward(input.float())
+        return super().forward(input)
+
+    @torch.no_grad()
+    def eval_affine(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the float64 per-channel ``(scale, shift)`` of the evaluation-mode layer.
+
+        Returns:
+            ``scale`` and ``shift`` with ``eval(x) == scale * x + shift``.
+        """
+        if self.running_mean is None or self.running_var is None:
+            raise ValueError("Only a BatchNorm with running statistics folds into an affine.")
+        scale = (self.running_var.double() + self.eps).rsqrt()
+        shift = -self.running_mean.double() * scale
+        if self.affine:
+            scale = scale * self.weight.double()
+            shift = shift * self.weight.double() + self.bias.double()
+        return scale, shift
+
+
+def build_block_norm(norm: str, channels: int) -> nn.Module:
+    """Build the normalization layer of a PTv3 block.
+
+    Args:
+        norm: ``"ln"`` for ``nn.LayerNorm`` (PTv3) or ``"bn"`` for :class:`PointBatchNorm`.
+        channels: Feature dimension.
+
+    Returns:
+        The normalization module.
+
+    Raises:
+        ValueError: Raised for an unknown ``norm``.
+    """
+    if norm == "ln":
+        return nn.LayerNorm(channels)
+    if norm == "bn":
+        return PointBatchNorm(channels, eps=1e-5, momentum=0.01)
+    raise ValueError(f"Unknown block norm {norm!r}, expected one of {BLOCK_NORMS}.")
+
+
 class MLP(nn.Module):
     """Apply the feed-forward sublayer used inside each PTv3 block.
 
@@ -803,6 +868,7 @@ class Block(PointModule):
         enable_attn: bool = True,
         rope_base: float | None = None,
         head_dim: int | None = None,
+        norm: str = "ln",
     ) -> None:
         """Initialize one PTv3 attention block.
 
@@ -834,6 +900,11 @@ class Block(PointModule):
                 ``None`` to disable it.
             head_dim: Per-head attention width, or ``None`` for
                 ``channels // num_heads``. See :class:`SerializedAttention`.
+            norm: Normalization of the block, ``"ln"`` (LayerNorm, the PTv3
+                default) or ``"bn"`` (:class:`PointBatchNorm`, SLAB-style: a
+                per-channel affine at inference that the export folds into the
+                adjacent linear layers). Applies to ``cpe.2``, ``norm0``,
+                ``norm1`` and ``norm2``.
 
         Raises:
             ValueError: Raised when the block would carry no operation at all.
@@ -841,7 +912,10 @@ class Block(PointModule):
         super().__init__()
         if not enable_conv and not enable_attn:
             raise ValueError("A block must enable at least one of convolution or attention.")
+        if norm not in BLOCK_NORMS:
+            raise ValueError(f"Unknown block norm {norm!r}, expected one of {BLOCK_NORMS}.")
         self.pre_norm = pre_norm
+        self.norm_type = norm
         self.enable_conv = bool(enable_conv)
         self.enable_attn = bool(enable_attn)
 
@@ -849,17 +923,17 @@ class Block(PointModule):
             self.cpe = PointSequential(
                 SubMConv3d(channels, channels, kernel_size=3, bias=True, indice_key=cpe_indice_key),
                 nn.Linear(channels, channels),
-                nn.LayerNorm(channels),
+                build_block_norm(norm, channels),
             )
             self.norm0 = None
         else:
             # No convolution to inject position, so the block normalizes on
             # entry and relies on RoPE plus serialization locality instead.
             self.cpe = None
-            self.norm0 = PointSequential(nn.LayerNorm(channels))
+            self.norm0 = PointSequential(build_block_norm(norm, channels))
 
         if self.enable_attn:
-            self.norm1 = PointSequential(nn.LayerNorm(channels))
+            self.norm1 = PointSequential(build_block_norm(norm, channels))
             self.attn = SerializedAttention(
                 channels=channels,
                 num_heads=num_heads,
@@ -876,7 +950,7 @@ class Block(PointModule):
                 rope_base=rope_base,
                 head_dim=head_dim,
             )
-            self.norm2 = PointSequential(nn.LayerNorm(channels))
+            self.norm2 = PointSequential(build_block_norm(norm, channels))
             self.mlp = PointSequential(MLP(channels, mlp_ratio, proj_drop))
         else:
             self.norm1 = None
@@ -898,6 +972,49 @@ class Block(PointModule):
         bias = linear.bias.double() + linear.weight.double() @ conv.bias.double()
         linear.bias.copy_(bias.to(linear.bias.dtype))
         conv.bias = None
+
+    @torch.no_grad()
+    def fold_batch_norms(self) -> None:
+        """Fold the evaluation-mode :class:`PointBatchNorm` layers into the adjacent linear layers.
+
+        With ``bn(x) = s * x + t`` per channel:
+
+        - ``cpe.2`` after ``cpe.1 = Linear(W, c)``: ``W' = diag(s) W``, ``c' = s c + t``;
+        - pre-norm ``norm1`` before ``attn.qkv`` and ``norm2`` before ``mlp.fc1``
+          (``Linear(W, c)``): ``W' = W diag(s)``, ``c' = c + W t``. The row gather between
+          ``norm1`` and ``qkv`` commutes with a per-channel affine.
+
+        The folded norms become ``nn.Identity``. ``norm0`` (no CPE) and post-norm blocks feed the
+        residual stream and stay a BatchNorm. Meant for an export copy in evaluation mode, the
+        parameters change in place. LayerNorm blocks are left untouched.
+        """
+        if self.norm_type != "bn":
+            return
+        if self.cpe is not None:
+            linear, norm = self.cpe._modules["1"], self.cpe._modules["2"]
+            if isinstance(norm, PointBatchNorm):
+                scale, shift = norm.eval_affine()
+                weight = scale[:, None] * linear.weight.double()
+                bias = scale * linear.bias.double() + shift
+                linear.weight.copy_(weight.to(linear.weight.dtype))
+                linear.bias.copy_(bias.to(linear.bias.dtype))
+                self.cpe._modules["2"] = nn.Identity()
+        if not self.pre_norm or self.attn is None:
+            return
+        for norm_name, linear in (("norm1", self.attn.qkv), ("norm2", self.mlp._modules["0"].fc1)):
+            norm = getattr(self, norm_name)._modules["0"]
+            if not isinstance(norm, PointBatchNorm):
+                continue
+            scale, shift = norm.eval_affine()
+            weight = linear.weight.double()
+            bias = weight @ shift
+            if linear.bias is not None:
+                bias = bias + linear.bias.double()
+            else:
+                linear.bias = nn.Parameter(torch.zeros_like(linear.weight[:, 0]))
+            linear.weight.copy_((weight * scale[None, :]).to(linear.weight.dtype))
+            linear.bias.copy_(bias.to(linear.bias.dtype))
+            setattr(self, norm_name, PointSequential(nn.Identity()))
 
     def forward(self, point: Point) -> Point:
         """Apply convolutional positional encoding, attention, and MLP.
@@ -1227,6 +1344,7 @@ def prepare_point_module_for_export(module: nn.Module) -> None:
             child.shuffle_orders = False
         if isinstance(child, Block):
             child.fold_cpe_bias()
+            child.fold_batch_norms()
 
 
 def deepcopy_without_flash(module: nn.Module) -> nn.Module:
@@ -1286,6 +1404,7 @@ class PointTransformerV3Encoder(PointModule):
         enc_attn: Sequence[bool] | bool = True,
         enc_rope_base: Sequence[float | None] | float | None = None,
         enc_head_dim: Sequence[int | None] | int | None = None,
+        enc_norm: str = "ln",
     ) -> None:
         """Initialize the PTv3 encoder.
 
@@ -1325,6 +1444,10 @@ class PointTransformerV3Encoder(PointModule):
                 (e.g. 16 with halved ``enc_num_head``) narrows the attention
                 inner width to ``enc_num_head[i] * enc_head_dim[i]`` while the
                 stage width stays ``enc_channels[i]``.
+            enc_norm: Normalization of every encoder block, ``"ln"`` (LayerNorm,
+                the default) or ``"bn"`` (:class:`PointBatchNorm` over all points
+                of the batch, folded into the adjacent linear layers on export).
+                See :class:`Block`.
         """
         super().__init__()
         self.in_channels = in_channels
@@ -1379,6 +1502,7 @@ class PointTransformerV3Encoder(PointModule):
                         enable_attn=self.enc_attn[stage_index],
                         rope_base=self.enc_rope_base[stage_index],
                         head_dim=self.enc_head_dim[stage_index],
+                        norm=enc_norm,
                     ),
                     name=f"block{block_index}",
                 )
