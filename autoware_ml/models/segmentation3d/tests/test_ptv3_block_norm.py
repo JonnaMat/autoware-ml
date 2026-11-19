@@ -31,6 +31,7 @@ from autoware_ml.models.segmentation3d.encoders.ptv3 import (
     Block,
     PointBatchNorm,
     PointTransformerV3Encoder,
+    ProgressiveLayerToBatchNorm,
 )
 from autoware_ml.ops.spconv.availability import IS_SPCONV_AVAILABLE
 
@@ -263,3 +264,148 @@ def test_export_folds_the_block_batch_norms(monkeypatch) -> None:
     )
     for key, value in model.state_dict().items():
         assert torch.equal(value, state[key]), key
+
+
+def test_progressive_norm_starts_as_layer_norm_and_ends_as_batch_norm() -> None:
+    """
+    Input: a ProgressiveLayerToBatchNorm with decay_steps 4, non-trivial LN and BN parameters,
+    run in eval before training, then for 2 and 4 training forward passes.
+    Expected: lam = 1 - step / 4: the layer is the LayerNorm at step 0, a blend in between and the
+    BatchNorm alone from step 4 on, in training and in eval.
+    Check: eval output at step 0 equals the LN; the training output at step 2 equals
+    0.5 LN + 0.5 BN(batch stats); from step 4 the train and eval outputs equal the BN's.
+    """
+    torch.manual_seed(0)
+    norm = ProgressiveLayerToBatchNorm(16, decay_steps=4)
+    nn.init.uniform_(norm.ln.weight, 0.5, 1.5)
+    nn.init.uniform_(norm.ln.bias, -0.5, 0.5)
+    _jitter_batch_norm(norm.bn)
+    x = torch.randn(300, 16) * 2.0 + 0.5
+    norm.eval()
+    torch.testing.assert_close(norm(x), norm.ln(x))
+    norm.train()
+    norm(x)
+    bn_train = copy.deepcopy(norm.bn)
+    blended = norm(x)
+    assert int(norm.step) == 2
+    torch.testing.assert_close(blended, 0.5 * norm.ln(x) + 0.5 * bn_train(x), rtol=1e-5, atol=1e-5)
+    norm(x)
+    bn_train = copy.deepcopy(norm.bn)
+    torch.testing.assert_close(norm(x), bn_train(x), rtol=1e-5, atol=1e-5)
+    norm.eval()
+    torch.testing.assert_close(norm(x), norm.bn(x))
+
+
+def test_progressive_norm_step_survives_a_state_dict_round_trip() -> None:
+    """
+    Input: a progressive norm trained 3 steps, its state loaded into a fresh one that already ran a
+    forward pass.
+    Expected: the step counter is checkpointed and the host-side mirror re-reads it.
+    Check: the state dict holds ln.*, bn.* and step; the loaded layer reports step 3 and its next
+    training pass gives lam = 1 - 4 / 8.
+    """
+    source = ProgressiveLayerToBatchNorm(8, decay_steps=8).train()
+    x = torch.randn(50, 8)
+    for _ in range(3):
+        source(x)
+    state = source.state_dict()
+    assert {"ln.weight", "ln.bias", "bn.weight", "bn.running_mean", "step"} <= set(state)
+    target = ProgressiveLayerToBatchNorm(8, decay_steps=8).eval()
+    target(x)
+    target.load_state_dict(state)
+    target.train()
+    target(x)
+    assert int(target.step) == 4
+    assert float(target.ln_weight()) == pytest.approx(0.5)
+
+
+def test_progressive_blocks_fold_only_after_the_blend() -> None:
+    """
+    Input: a block with norm="ln2bn" (decay 2) in eval, folded before and after 2 training passes.
+    Expected: only the pure BatchNorm folds; a part-LayerNorm blend must not be exported as an
+    affine.
+    Check: ValueError before the blend ends; afterwards cpe.1 / qkv / fc1 reproduce the unfolded
+    paths within 1e-5 and the norms are Identity.
+    """
+    torch.manual_seed(0)
+    block = Block(
+        channels=16,
+        num_heads=2,
+        patch_size=4,
+        mlp_ratio=2.0,
+        qkv_bias=True,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        drop_path=0.0,
+        pre_norm=True,
+        order_index=0,
+        cpe_indice_key="stage0",
+        enable_rpe=False,
+        enable_flash=False,
+        upcast_attention=False,
+        upcast_softmax=False,
+        norm="ln2bn",
+        norm_decay_steps=2,
+    ).eval()
+    with pytest.raises(ValueError, match="blend"):
+        copy.deepcopy(block).fold_batch_norms()
+    x = torch.randn(200, 16) * 2.0 + 0.5
+    norms = [m for m in block.modules() if isinstance(m, ProgressiveLayerToBatchNorm)]
+    assert len(norms) == 3
+    for norm in norms:
+        _jitter_batch_norm(norm.bn)
+        norm.train()
+        norm(x)
+        norm(x)
+        norm.eval()
+    folded = copy.deepcopy(block)
+    folded.fold_batch_norms()
+    with torch.no_grad():
+        reference = block.cpe._modules["2"](block.cpe._modules["1"](x))
+        torch.testing.assert_close(folded.cpe._modules["1"](x), reference, rtol=1e-5, atol=1e-5)
+        reference = block.attn.qkv(block.norm1._modules["0"](x))
+        torch.testing.assert_close(folded.attn.qkv(x), reference, rtol=1e-5, atol=1e-5)
+        fc1 = block.mlp._modules["0"].fc1
+        reference = fc1(block.norm2._modules["0"](x))
+        torch.testing.assert_close(folded.mlp._modules["0"].fc1(x), reference, rtol=1e-5, atol=1e-5)
+    assert isinstance(folded.norm1._modules["0"], nn.Identity)
+
+
+def test_progressive_encoder_requires_a_decay_length() -> None:
+    """
+    Input: the test encoder with enc_norm="ln2bn" without and with enc_norm_decay_steps.
+    Expected: the blend length must be given explicitly.
+    Check: ValueError without it; with it every block norm is a ProgressiveLayerToBatchNorm.
+    """
+    with pytest.raises(ValueError, match="enc_norm_decay_steps"):
+        build_ptv3_encoder(enc_norm="ln2bn")
+    encoder = PointTransformerV3Encoder(
+        **{**_encoder_kwargs(), "enc_norm": "ln2bn", "enc_norm_decay_steps": 10}
+    )
+    norms = _block_norms(encoder)
+    assert norms and all(isinstance(norm, ProgressiveLayerToBatchNorm) for norm in norms)
+
+
+def _encoder_kwargs() -> dict:
+    return dict(
+        in_channels=4,
+        order=("z",),
+        stride=(2,),
+        enc_depths=(1, 1),
+        enc_channels=(8, 16),
+        enc_num_head=(1, 2),
+        enc_patch_size=(4, 4),
+        mlp_ratio=2.0,
+        qkv_bias=True,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        drop_path=0.0,
+        pre_norm=True,
+        shuffle_orders=False,
+        enable_rpe=False,
+        enable_flash=False,
+        upcast_attention=False,
+        upcast_softmax=False,
+    )

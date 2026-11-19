@@ -740,7 +740,7 @@ class SerializedAttention(PointModule):
         return point
 
 
-BLOCK_NORMS = ("ln", "bn")
+BLOCK_NORMS = ("ln", "bn", "ln2bn")
 
 
 class PointBatchNorm(nn.BatchNorm1d):
@@ -785,12 +785,75 @@ class PointBatchNorm(nn.BatchNorm1d):
         return scale, shift
 
 
-def build_block_norm(norm: str, channels: int) -> nn.Module:
+class ProgressiveLayerToBatchNorm(nn.Module):
+    """Blend a LayerNorm into a :class:`PointBatchNorm` over training (SLAB's progressive LN -> BN).
+
+    ``y = lam * ln(x) + (1 - lam) * bn(x)`` with ``lam = max(0, 1 - step / decay_steps)``, where
+    ``step`` counts the training-mode forward passes (a persistent buffer, so it survives resume;
+    every DDP rank counts the same). The LayerNorm takes the pretrained LN's parameters, so the model
+    starts exactly at the LayerNorm network; from ``decay_steps`` on the layer is the BatchNorm alone,
+    which folds into the adjacent linear layers on export. Both branches run while ``lam > 0``.
+    """
+
+    def __init__(self, channels: int, decay_steps: int) -> None:
+        """Initialize the blended normalization.
+
+        Args:
+            channels: Feature dimension.
+            decay_steps: Training forward passes over which ``lam`` falls from 1 to 0.
+
+        Raises:
+            ValueError: Raised for a non-positive ``decay_steps``.
+        """
+        super().__init__()
+        if decay_steps <= 0:
+            raise ValueError("decay_steps must be positive.")
+        self.decay_steps = int(decay_steps)
+        self.ln = nn.LayerNorm(channels)
+        self.bn = PointBatchNorm(channels, eps=1e-5, momentum=0.01)
+        self.register_buffer("step", torch.zeros((), dtype=torch.long))
+        # host-side mirror of ``step``, read once from the buffer, so no forward synchronizes
+        self._host_step: int | None = None
+
+    def _load_from_state_dict(self, *args: Any, **kwargs: Any) -> None:
+        """Load the state and re-read the step counter on the next forward."""
+        super()._load_from_state_dict(*args, **kwargs)
+        self._host_step = None
+
+    def ln_weight(self) -> torch.Tensor:
+        """Return the current LayerNorm share ``lam`` as a float tensor."""
+        return (1.0 - self.step.float() / self.decay_steps).clamp(0.0, 1.0)
+
+    def forward(
+        self, input: Float[torch.Tensor, "num_points channels"]
+    ) -> Float[torch.Tensor, "num_points channels"]:
+        """Normalize the features with the current LN/BN blend.
+
+        Args:
+            input: Point features.
+
+        Returns:
+            Normalized features.
+        """
+        if self._host_step is None:
+            self._host_step = int(self.step)
+        if self.training:
+            self.step += 1
+            self._host_step += 1
+        if self._host_step >= self.decay_steps:
+            return self.bn(input)
+        lam = self.ln_weight()
+        return lam * self.ln(input) + (1.0 - lam) * self.bn(input)
+
+
+def build_block_norm(norm: str, channels: int, decay_steps: int | None = None) -> nn.Module:
     """Build the normalization layer of a PTv3 block.
 
     Args:
-        norm: ``"ln"`` for ``nn.LayerNorm`` (PTv3) or ``"bn"`` for :class:`PointBatchNorm`.
+        norm: ``"ln"`` for ``nn.LayerNorm`` (PTv3), ``"bn"`` for :class:`PointBatchNorm`, or
+            ``"ln2bn"`` for :class:`ProgressiveLayerToBatchNorm`.
         channels: Feature dimension.
+        decay_steps: LN -> BN blend length of ``"ln2bn"``.
 
     Returns:
         The normalization module.
@@ -802,7 +865,29 @@ def build_block_norm(norm: str, channels: int) -> nn.Module:
         return nn.LayerNorm(channels)
     if norm == "bn":
         return PointBatchNorm(channels, eps=1e-5, momentum=0.01)
+    if norm == "ln2bn":
+        if decay_steps is None:
+            raise ValueError("enc_norm 'ln2bn' needs enc_norm_decay_steps.")
+        return ProgressiveLayerToBatchNorm(channels, decay_steps)
     raise ValueError(f"Unknown block norm {norm!r}, expected one of {BLOCK_NORMS}.")
+
+
+def _foldable_batch_norm(norm: nn.Module) -> nn.Module:
+    """Return the BatchNorm a block norm evaluates to, for folding.
+
+    A :class:`ProgressiveLayerToBatchNorm` folds only once its blend has reached the BatchNorm.
+
+    Raises:
+        ValueError: Raised for a blend that still carries LayerNorm.
+    """
+    if isinstance(norm, ProgressiveLayerToBatchNorm):
+        if int(norm.step) < norm.decay_steps:
+            raise ValueError(
+                f"LN -> BN blend at step {int(norm.step)} of {norm.decay_steps}: still part "
+                "LayerNorm, cannot fold into an affine."
+            )
+        return norm.bn
+    return norm
 
 
 class MLP(nn.Module):
@@ -869,6 +954,7 @@ class Block(PointModule):
         rope_base: float | None = None,
         head_dim: int | None = None,
         norm: str = "ln",
+        norm_decay_steps: int | None = None,
     ) -> None:
         """Initialize one PTv3 attention block.
 
@@ -903,8 +989,11 @@ class Block(PointModule):
             norm: Normalization of the block, ``"ln"`` (LayerNorm, the PTv3
                 default) or ``"bn"`` (:class:`PointBatchNorm`, SLAB-style: a
                 per-channel affine at inference that the export folds into the
-                adjacent linear layers). Applies to ``cpe.2``, ``norm0``,
-                ``norm1`` and ``norm2``.
+                adjacent linear layers), or ``"ln2bn"``
+                (:class:`ProgressiveLayerToBatchNorm`, LN blended into BN over
+                ``norm_decay_steps`` training steps). Applies to ``cpe.2``,
+                ``norm0``, ``norm1`` and ``norm2``.
+            norm_decay_steps: Blend length of ``norm="ln2bn"``.
 
         Raises:
             ValueError: Raised when the block would carry no operation at all.
@@ -923,17 +1012,17 @@ class Block(PointModule):
             self.cpe = PointSequential(
                 SubMConv3d(channels, channels, kernel_size=3, bias=True, indice_key=cpe_indice_key),
                 nn.Linear(channels, channels),
-                build_block_norm(norm, channels),
+                build_block_norm(norm, channels, norm_decay_steps),
             )
             self.norm0 = None
         else:
             # No convolution to inject position, so the block normalizes on
             # entry and relies on RoPE plus serialization locality instead.
             self.cpe = None
-            self.norm0 = PointSequential(build_block_norm(norm, channels))
+            self.norm0 = PointSequential(build_block_norm(norm, channels, norm_decay_steps))
 
         if self.enable_attn:
-            self.norm1 = PointSequential(build_block_norm(norm, channels))
+            self.norm1 = PointSequential(build_block_norm(norm, channels, norm_decay_steps))
             self.attn = SerializedAttention(
                 channels=channels,
                 num_heads=num_heads,
@@ -950,7 +1039,7 @@ class Block(PointModule):
                 rope_base=rope_base,
                 head_dim=head_dim,
             )
-            self.norm2 = PointSequential(build_block_norm(norm, channels))
+            self.norm2 = PointSequential(build_block_norm(norm, channels, norm_decay_steps))
             self.mlp = PointSequential(MLP(channels, mlp_ratio, proj_drop))
         else:
             self.norm1 = None
@@ -988,10 +1077,10 @@ class Block(PointModule):
         residual stream and stay a BatchNorm. Meant for an export copy in evaluation mode, the
         parameters change in place. LayerNorm blocks are left untouched.
         """
-        if self.norm_type != "bn":
+        if self.norm_type == "ln":
             return
         if self.cpe is not None:
-            linear, norm = self.cpe._modules["1"], self.cpe._modules["2"]
+            linear, norm = self.cpe._modules["1"], _foldable_batch_norm(self.cpe._modules["2"])
             if isinstance(norm, PointBatchNorm):
                 scale, shift = norm.eval_affine()
                 weight = scale[:, None] * linear.weight.double()
@@ -1002,7 +1091,7 @@ class Block(PointModule):
         if not self.pre_norm or self.attn is None:
             return
         for norm_name, linear in (("norm1", self.attn.qkv), ("norm2", self.mlp._modules["0"].fc1)):
-            norm = getattr(self, norm_name)._modules["0"]
+            norm = _foldable_batch_norm(getattr(self, norm_name)._modules["0"])
             if not isinstance(norm, PointBatchNorm):
                 continue
             scale, shift = norm.eval_affine()
@@ -1405,6 +1494,7 @@ class PointTransformerV3Encoder(PointModule):
         enc_rope_base: Sequence[float | None] | float | None = None,
         enc_head_dim: Sequence[int | None] | int | None = None,
         enc_norm: str = "ln",
+        enc_norm_decay_steps: int | None = None,
     ) -> None:
         """Initialize the PTv3 encoder.
 
@@ -1446,8 +1536,10 @@ class PointTransformerV3Encoder(PointModule):
                 stage width stays ``enc_channels[i]``.
             enc_norm: Normalization of every encoder block, ``"ln"`` (LayerNorm,
                 the default) or ``"bn"`` (:class:`PointBatchNorm` over all points
-                of the batch, folded into the adjacent linear layers on export).
-                See :class:`Block`.
+                of the batch, folded into the adjacent linear layers on export) or
+                ``"ln2bn"`` (LayerNorm blended into that BatchNorm over
+                ``enc_norm_decay_steps`` training steps). See :class:`Block`.
+            enc_norm_decay_steps: Blend length of ``enc_norm="ln2bn"``.
         """
         super().__init__()
         self.in_channels = in_channels
@@ -1503,6 +1595,7 @@ class PointTransformerV3Encoder(PointModule):
                         rope_base=self.enc_rope_base[stage_index],
                         head_dim=self.enc_head_dim[stage_index],
                         norm=enc_norm,
+                        norm_decay_steps=enc_norm_decay_steps,
                     ),
                     name=f"block{block_index}",
                 )
