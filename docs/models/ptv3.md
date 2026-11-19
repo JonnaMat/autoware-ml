@@ -241,6 +241,55 @@ The split export produces one graph per `deploy.onnx.modules` entry:
   `pooling_cluster_{S-2}`, and `point_grid_coord_{S-2}` and outputs the
   detection head tensors.
 
+## One-shot pruning
+
+`oneshot_prune` removes attention heads from a trained encoder without
+finetuning. Every block keeps the heads whose removal changes the attention
+output least on a set of calibration frames from the train split. The block's
+`attn.proj` is then refit to the kept heads by damped least squares, and the
+dropped heads' mean output moves into its bias. Blocks are calibrated in
+forward order, each with the earlier blocks already pruned. The kept heads keep
+the trained head width, so the encoder takes `enc_head_dim` next to the
+smaller `enc_num_head`.
+
+```bash
+python -m autoware_ml.scripts.tools.ptv3.oneshot_prune \
+    --config-name multi/ptv3/t4dataset/<config> \
+    '++weights=[<trained>.ckpt]' +prune.output=<pruned>.ckpt \
+    '+prune.num_heads=[1,2,4,8,16]'
+```
+
+The written checkpoint holds the weights only. The tool logs the overrides that
+build the pruned model; pass them with `--weights <pruned>.ckpt` to `test`,
+`deploy` or a finetuning run:
+
+```text
+model.encoder.enc_num_head=[1,2,4,8,16] +model.encoder.enc_head_dim=16
+```
+
+Calibrate on the train split of the domain the pruned model is meant for. The
+refit fits the statistics of the calibration frames: in our measurements, the
+same refit calibrated on frames of another domain lost 1.6 pp mAP and 3.4 pp
+mIoU on the target domain, while target-domain frames kept both within 0.5 pp.
+The frames come from the train split of the run's config by default. Another
+dataset and split are named by a config and its overrides:
+
+```bash
+python -m autoware_ml.scripts.tools.ptv3.oneshot_prune \
+    --config-name multi/ptv3/t4dataset/<config> \
+    '++weights=[<trained>.ckpt]' +prune.output=<pruned>.ckpt \
+    '+prune.num_heads=[1,2,4,8,16]' \
+    +prune.calibration_config=<target-domain config> \
+    '+prune.calibration_overrides=["<override>",...]' \
+    +prune.calibration_split=train +prune.num_frames=256
+```
+
+One frame is taken from each of `num_frames` scenes spread evenly over the
+split, so the selection is deterministic, and the tool refuses frames whose
+scene is in the validation or test split of that dataset. `+prune.damp` (0.01)
+and `+prune.device` (`cuda`) are optional too. The method is described in the
+module docstring.
+
 ## Implementation
 
 | Path                                                                    | Description                                        |
@@ -251,6 +300,7 @@ The split export produces one graph per `deploy.onnx.modules` entry:
 | `autoware_ml/models/detection3d/heads/transfusions/transfusion_head.py` | TransFusion detection head                         |
 | `autoware_ml/models/segmentation3d/encoders/ptv3.py`                    | Reusable PTv3 encoder components                   |
 | `autoware_ml/models/segmentation3d/encoders/voxel.py`                   | Voxel feature encoders of single frames and sweeps |
+| `autoware_ml/scripts/tools/ptv3/oneshot_prune.py`                       | One-shot head pruning with a least-squares refit   |
 | `autoware_ml/utils/point_cloud/`                                        | Shared point-cloud utilities and serialization     |
 | `autoware_ml/ops/segment/segment_csr.py`                                | Segment reduction export operator                  |
 | `autoware_ml/losses/segmentation3d/`                                    | Segmentation losses used by PTv3                   |
