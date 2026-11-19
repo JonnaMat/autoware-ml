@@ -13,9 +13,12 @@ inside ``result`` at epoch end.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
+import torch
 import torch.nn as nn
 
 from autoware_ml.dataclasses.models.model_batch_inputs import ModelBatchInputs
@@ -147,8 +150,75 @@ class MetricEvalMixin:
         eval_out = self.build_eval_output(batch, raw_outputs)
         if batch_idx == 0:
             self._check_required_keys(list(metrics), eval_out)
+        dump_dir = os.environ.get("AML_EVAL_DUMP_DIR")
+        if dump_dir and stage is EvalStage.TEST:
+            self._dump_eval_inputs(Path(dump_dir), list(metrics), eval_out, batch_idx)
         for metric in metrics:
             metric.update(eval_out)
+
+    def _dump_eval_inputs(
+        self, dump_dir: Path, metrics: list, eval_out: Mapping[str, Any], batch_idx: int
+    ) -> None:
+        """Opt-in (``AML_EVAL_DUMP_DIR``): save what the ``det3d`` and ``seg3d`` suites read.
+
+        One file per test batch, for offline per-scene slicing with the same suites: the raw
+        detection inputs per frame (predictions, unfiltered GT boxes/labels/point counts,
+        padding flag) and, per frame, the ``seg3d`` confusion matrix of every range bucket
+        (``[R+1, C, C]``, bucket 0 whole scene) built as the suite's ``update`` does. The
+        scene token (``<db>/<uuid>/<version>``) is stored per frame. Metrics are unaffected.
+        """
+        record: dict[str, Any] = {"batch_idx": batch_idx}
+        suites = {getattr(metric, "prefix", None): metric for metric in metrics}
+
+        def cpu(value: Any) -> Any:
+            return value.detach().cpu() if isinstance(value, torch.Tensor) else value
+
+        if "det3d" in suites and "predictions" in eval_out:
+            num_points = eval_out.get("gt_num_points")
+            record["det3d"] = {
+                "predictions": [
+                    {key: cpu(value) for key, value in prediction.items()}
+                    for prediction in eval_out["predictions"]
+                ],
+                "gt_boxes": [cpu(boxes) for boxes in eval_out["gt_boxes"]],
+                "gt_labels": [cpu(labels) for labels in eval_out["gt_labels"]],
+                "gt_num_points": [cpu(n) for n in num_points] if num_points is not None else None,
+                "padding_mask": list(eval_out.get("padding_mask") or []),
+                "scene_token": list(eval_out.get("scene_token") or []),
+            }
+        seg = suites.get("seg3d")
+        if seg is not None and "seg3d_frames" in eval_out:
+            frames = []
+            for frame in eval_out["seg3d_frames"]:
+                predictions = frame["pred"].detach().reshape(-1)
+                targets = frame["target"].detach().reshape(-1)
+                coord = frame["coord"].detach().to(dtype=torch.float32)
+                valid = (
+                    (targets != seg.ignore_index)
+                    & (targets >= 0)
+                    & (targets < seg.num_classes)
+                    & (predictions >= 0)
+                    & (predictions < seg.num_classes)
+                )
+                targets = targets[valid].long()
+                predictions = predictions[valid].long()
+                coord = coord[valid]
+                confusion = torch.zeros(
+                    len(seg.ranges) + 1, seg.num_classes, seg.num_classes, dtype=torch.long
+                )
+                confusion[0] = seg._counts(predictions, targets).cpu()
+                distance = torch.linalg.vector_norm(coord[:, :2], dim=1)
+                for index, metric_range in enumerate(seg.ranges):
+                    in_range = distance >= metric_range.min_distance
+                    if metric_range.max_distance is not None:
+                        in_range &= distance < metric_range.max_distance
+                    confusion[index + 1] = seg._counts(
+                        predictions[in_range], targets[in_range]
+                    ).cpu()
+                frames.append({"confusion": confusion, "scene_token": frame.get("scene_token")})
+            record["seg3d"] = frames
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(record, dump_dir / f"batch_{batch_idx:05d}.pt")
 
     def _check_required_keys(self, metrics: list, eval_out: Mapping[str, Any]) -> None:
         for metric in metrics:
