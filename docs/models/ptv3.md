@@ -243,12 +243,14 @@ The split export produces one graph per `deploy.onnx.modules` entry:
 
 ## One-shot pruning
 
-`oneshot_prune` removes attention heads from a trained encoder without
-finetuning. Every block keeps the heads whose removal changes the attention
-output least on a set of calibration frames from the train split. The block's
-`attn.proj` is then refit to the kept heads by damped least squares, and the
-dropped heads' mean output moves into its bias. Blocks are calibrated in
-forward order, each with the earlier blocks already pruned. The kept heads keep
+`oneshot_prune` removes attention heads, MLP hidden units or both from a trained
+encoder without finetuning. Every block keeps the heads whose removal changes
+the attention output least on a set of calibration frames from the train split,
+and the hidden units with the largest Wanda score (column norm times input
+energy). The layer after the pruned units (`attn.proj` or `mlp.0.fc2`) is then
+refit to the kept units by damped least squares, and the dropped units' mean
+output moves into its bias. Blocks are calibrated in forward order, attention
+before MLP, each with everything before it already pruned. The kept heads keep
 the trained head width, so the encoder takes `enc_head_dim` next to the
 smaller `enc_num_head`.
 
@@ -256,20 +258,24 @@ smaller `enc_num_head`.
 python -m autoware_ml.scripts.tools.ptv3.oneshot_prune \
     --config-name multi/ptv3/t4dataset/<config> \
     '++weights=[<trained>.ckpt]' +prune.output=<pruned>.ckpt \
-    '+prune.num_heads=[1,2,4,8,16]'
+    '+prune.num_heads=[1,2,4,8,16]' +prune.mlp_ratio=3
 ```
 
-The written checkpoint holds the weights only. The tool logs the overrides that
-build the pruned model; pass them with `--weights <pruned>.ckpt` to `test`,
-`deploy` or a finetuning run:
+Either `prune.num_heads` or `prune.mlp_ratio` may be left out. The written
+checkpoint holds the weights only. The tool logs the overrides that build the
+pruned model; pass them with `--weights <pruned>.ckpt` to `test`, `deploy` or a
+finetuning run:
 
 ```text
-model.encoder.enc_num_head=[1,2,4,8,16] +model.encoder.enc_head_dim=16
+model.encoder.enc_num_head=[1,2,4,8,16] +model.encoder.enc_head_dim=16 model.encoder.mlp_ratio=3 model.seg3d_head.mlp_ratio=4
 ```
 
+The seg3d head reads its MLP ratio from the encoder's, so a narrower encoder MLP
+pins it back to the trained value; detection-only configs have no such head.
+
 Calibrate on the train split of the domain the pruned model is meant for. The
-refit fits the statistics of the calibration frames: in our measurements, the
-same refit calibrated on frames of another domain lost 1.6 pp mAP and 3.4 pp
+refit fits the statistics of the calibration frames: in our measurements, a
+heads/2 refit calibrated on frames of another domain lost 1.6 pp mAP and 3.4 pp
 mIoU on the target domain, while target-domain frames kept both within 0.5 pp.
 The frames come from the train split of the run's config by default. Another
 dataset and split are named by a config and its overrides:
@@ -278,7 +284,7 @@ dataset and split are named by a config and its overrides:
 python -m autoware_ml.scripts.tools.ptv3.oneshot_prune \
     --config-name multi/ptv3/t4dataset/<config> \
     '++weights=[<trained>.ckpt]' +prune.output=<pruned>.ckpt \
-    '+prune.num_heads=[1,2,4,8,16]' \
+    '+prune.num_heads=[1,2,4,8,16]' +prune.mlp_ratio=3 \
     +prune.calibration_config=<target-domain config> \
     '+prune.calibration_overrides=["<override>",...]' \
     +prune.calibration_split=train +prune.num_frames=256
@@ -300,7 +306,7 @@ module docstring.
 | `autoware_ml/models/detection3d/heads/transfusions/transfusion_head.py` | TransFusion detection head                         |
 | `autoware_ml/models/segmentation3d/encoders/ptv3.py`                    | Reusable PTv3 encoder components                   |
 | `autoware_ml/models/segmentation3d/encoders/voxel.py`                   | Voxel feature encoders of single frames and sweeps |
-| `autoware_ml/scripts/tools/ptv3/oneshot_prune.py`                       | One-shot head pruning with a least-squares refit   |
+| `autoware_ml/scripts/tools/ptv3/oneshot_prune.py`                       | One-shot head and MLP pruning with a refit         |
 | `autoware_ml/utils/point_cloud/`                                        | Shared point-cloud utilities and serialization     |
 | `autoware_ml/ops/segment/segment_csr.py`                                | Segment reduction export operator                  |
 | `autoware_ml/losses/segmentation3d/`                                    | Segmentation losses used by PTv3                   |

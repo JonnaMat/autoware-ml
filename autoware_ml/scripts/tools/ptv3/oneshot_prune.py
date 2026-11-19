@@ -12,36 +12,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""One-shot structured pruning of the PTv3 encoder attention heads, without finetuning.
+"""One-shot structured pruning of the PTv3 encoder, without finetuning.
 
-Every encoder block keeps fewer attention heads at the trained head width. The block's
-``attn.proj`` is then refit on the kept heads so its output stays close to the unpruned one.
+Every encoder block keeps fewer attention heads at the trained head width, fewer MLP hidden
+units, or both. The layer after the pruned units (``attn.proj`` for heads, ``mlp.0.fc2`` for
+hidden units) is then refit on the kept units so its output stays close to the unpruned one.
 The statistics come from a few hundred calibration frames.
 
-Notation for the ``attn.proj`` of one block, ``y = W x + b``: ``x`` concatenates the
-per-head attention outputs, so head ``h`` owns the columns ``W_h`` of ``W``. Statistics of
-``x`` are accumulated in float64 over every token of the calibration frames: the second
-moment ``M``, the mean ``mu`` and the centred covariance ``S = M / n - mu mu^T``.
+Notation for that layer, ``y = W x + b``: for heads, ``x`` concatenates the per-head attention
+outputs, so head ``h`` owns the columns ``W_h`` of ``W``; for the MLP, ``x`` is the GELU
+output. Statistics of ``x`` are accumulated in float64 over every token of the calibration
+frames: the second moment ``M``, the mean ``mu`` and the centred covariance
+``S = M / n - mu mu^T``.
 
-* Selection: removing the head set ``P`` changes the attention output by
+* Head selection: removing the head set ``P`` changes the attention output by
   ``E||sum_{h in P} W_h x_h||^2 = sum_{i, j in P} G_ij`` with the head Gram
   ``G_ij = sum_{a in i, b in j} (W^T W)_ab M_ab / n``. The dropped set minimises it,
   exhaustively for up to 200k candidate sets and greedily with a one-swap search above.
+* Hidden-unit selection (Wanda per unit): unit ``j`` scores ``||W[:, j]||^2 M_jj / n``, and the
+  highest scores are kept.
 * Refit: a damped ridge least-squares fit of the kept columns ``K`` to the unpruned output,
   ``min E||W' x_K + b' - (W x + b)||^2 + lam ||W' - W_K||^2``, solved in float64 as
   ``W' = W_K + W_P S_PK (S_KK + lam I)^-1`` and ``b' = b + W mu - W' mu_K``. The bias takes
-  the dropped heads' mean contribution. ``lam`` is ``damp`` times the mean of
+  the dropped units' mean contribution. ``lam`` is ``damp`` times the mean of
   ``diag(S_KK)``.
-* Sequential calibration: blocks are pruned in forward order, and the statistics of a block
-  are taken with every earlier block already pruned and refit. The fit target is the
-  unpruned ``attn.proj`` applied to those inputs.
+* Sequential calibration: blocks are pruned in forward order, the attention of a block before
+  its MLP, and the statistics of a layer are taken with everything before it already pruned
+  and refit. The fit target is the unpruned layer applied to those inputs.
 
-The pruning runs on the export copy of the encoder, as a mask: the dropped heads' ``proj``
-columns are zero. The written checkpoint keeps the kept heads of ``qkv`` (laid out
-``(3, heads, head_dim, channels)``) and ``proj``, in their original order, so the pruned
-model is selected by Hydra overrides alone. Every other tensor is copied unchanged. The
-optimizer, scheduler and loop state are dropped, since they describe the unpruned
-parameters, so the checkpoint is used with ``--weights``.
+The pruning runs on the export copy of the encoder, as a mask: the dropped units' columns of
+``proj`` / ``fc2`` are zero. The written checkpoint keeps the kept heads of ``qkv`` (laid out
+``(3, heads, head_dim, channels)``) and ``proj``, and the kept hidden units of ``fc1`` and
+``fc2``, in their original order, so the pruned model is selected by Hydra overrides alone.
+Every other tensor is copied unchanged. The optimizer, scheduler and loop state are dropped,
+since they describe the unpruned parameters, so the checkpoint is used with ``--weights``.
 
 Calibration frames should come from the train split of the domain the pruned model is meant
 for: the refit fits the statistics of its calibration frames, and frames from another domain
@@ -53,19 +57,22 @@ split. The frames are read with the test transforms. One frame is taken from eac
 scene, so the selection is deterministic. The tool refuses calibration frames whose scene is
 also in the validation or test split of the calibration dataset.
 
-Usage, halving the heads of every stage at head width 16::
+Usage, halving the heads of every stage at head width 16 and narrowing the MLP from 4 to 3
+times the stage width::
 
     python -m autoware_ml.scripts.tools.ptv3.oneshot_prune \\
         --config-name multi/ptv3/t4dataset/<config> \\
         '++weights=[<trained>.ckpt]' +prune.output=<pruned>.ckpt \\
-        '+prune.num_heads=[1,2,4,8,16]'
+        '+prune.num_heads=[1,2,4,8,16]' +prune.mlp_ratio=3
 
-Optional keys: ``+prune.calibration_config`` (the run's config),
+Either ``prune.num_heads`` or ``prune.mlp_ratio`` may be left out. Optional keys:
+``+prune.calibration_config`` (the run's config),
 ``'+prune.calibration_overrides=["<key>=<value>",...]'`` (none, each override quoted),
-``+prune.calibration_split`` (``train``),
-``+prune.num_frames`` (256), ``+prune.damp`` (0.01) and ``+prune.device`` (``cuda``). The
-tool logs the overrides that build the pruned model, e.g.
-``model.encoder.enc_num_head=[1,2,4,8,16] +model.encoder.enc_head_dim=16``.
+``+prune.calibration_split`` (``train``), ``+prune.num_frames`` (256), ``+prune.damp`` (0.01)
+and ``+prune.device`` (``cuda``). The tool logs the overrides that build the pruned model,
+e.g. ``model.encoder.enc_num_head=[1,2,4,8,16] +model.encoder.enc_head_dim=16
+model.encoder.mlp_ratio=3 model.seg3d_head.mlp_ratio=4``. The seg3d head reads its MLP ratio
+from the encoder's, so a narrower encoder MLP pins it back to the trained value.
 """
 
 from __future__ import annotations
@@ -113,6 +120,16 @@ _TRAINING_STATE_KEYS = ("optimizer_states", "lr_schedulers", "loops", "callbacks
 # Above this many candidate drop sets the head selection is greedy.
 _MAX_EXHAUSTIVE_SETS = 200_000
 _GOLDEN_RATIO_FRACTION = 0.6180339887
+_PRUNED_LAYERS = (
+    "attn.qkv.weight",
+    "attn.qkv.bias",
+    "attn.proj.weight",
+    "attn.proj.bias",
+    "mlp.0.fc1.weight",
+    "mlp.0.fc1.bias",
+    "mlp.0.fc2.weight",
+    "mlp.0.fc2.bias",
+)
 
 
 class _StopForward(Exception):
@@ -268,6 +285,26 @@ def head_columns(heads: Sequence[int], head_dim: int) -> list[int]:
     return [head * head_dim + channel for head in heads for channel in range(head_dim)]
 
 
+def select_hidden_units(weight: torch.Tensor, second_moment: torch.Tensor, keep: int) -> list[int]:
+    """Return the MLP hidden units to keep, by the Wanda score ``||W[:, j]||^2 M_jj``.
+
+    Args:
+        weight: Weight of the layer after the hidden units, ``(out, hidden)``.
+        second_moment: Mean second moment ``M / n`` of the hidden units.
+        keep: Number of units to keep.
+
+    Returns:
+        The kept units, ascending.
+
+    Raises:
+        ValueError: If ``keep`` is not between 1 and the unit count.
+    """
+    if not 1 <= keep <= weight.shape[1]:
+        raise ValueError(f"Cannot keep {keep} of {weight.shape[1]} hidden units.")
+    scores = weight.double().square().sum(0) * torch.diagonal(second_moment.double())
+    return sorted(torch.argsort(scores, descending=True)[:keep].tolist())
+
+
 def refit_linear(
     weight: torch.Tensor,
     bias: torch.Tensor,
@@ -342,79 +379,123 @@ class AttentionPruning:
     head_dim: int
 
 
+@dataclass(frozen=True)
+class BlockPruning:
+    """Kept units of one block.
+
+    Attributes:
+        attention: Kept heads, or ``None`` when the heads are not pruned.
+        hidden_units: Kept MLP hidden units, ascending, or ``None`` when the MLP is not pruned.
+    """
+
+    attention: AttentionPruning | None = None
+    hidden_units: list[int] | None = None
+
+
+def _refit_masked(
+    layer: nn.Linear, statistics: InputStatistics, kept_columns: Sequence[int], damp: float
+) -> None:
+    """Refit ``layer`` on ``kept_columns`` in place and zero its other input columns."""
+    weight, bias = refit_linear(layer.weight, layer.bias, statistics, kept_columns, damp)
+    layer.weight.zero_()
+    layer.weight[:, list(kept_columns)] = weight
+    layer.bias.copy_(bias)
+
+
 @torch.no_grad()
-def prune_encoder_heads(
+def prune_encoder(
     encoder: nn.Module,
-    num_heads: Sequence[int],
     run_model: Callable[[Any], object],
     frames: Sequence[Any],
     damp: float,
-) -> dict[str, AttentionPruning]:
-    """Prune the attention heads of ``encoder`` in place, as a mask, with sequential calibration.
+    num_heads: Sequence[int] | None = None,
+    mlp_ratio: float | None = None,
+) -> dict[str, BlockPruning]:
+    """Prune ``encoder`` in place, as a mask, with sequential calibration.
 
-    Every block of stage ``s`` keeps ``num_heads[s]`` heads. The dropped heads' ``proj``
-    columns become zero and the kept ones hold the refit weights, see :func:`refit_linear`.
+    Every block of stage ``s`` keeps ``num_heads[s]`` heads and ``int(channels * mlp_ratio)``
+    MLP hidden units. The dropped units' columns of ``attn.proj`` / ``mlp.0.fc2`` become zero
+    and the kept ones hold the refit weights, see :func:`refit_linear`. A block's attention is
+    pruned before its MLP.
 
     Args:
         encoder: PTv3 encoder, changed in place.
-        num_heads: Heads kept per stage.
         run_model: Runs the model that contains ``encoder`` on one frame.
         frames: Calibration frames.
         damp: Ridge strength of the refit.
+        num_heads: Heads kept per stage, or ``None`` to keep every head.
+        mlp_ratio: Target MLP expansion ratio, or ``None`` to keep every hidden unit.
 
     Returns:
-        The kept heads of every block, by block name.
+        The kept units of every block, by block name.
 
     Raises:
         ValueError: If ``num_heads`` does not have one entry per stage.
     """
     blocks = encoder_blocks(encoder)
     stage_count = max(stage for _, stage, _ in blocks) + 1
-    if len(num_heads) != stage_count:
+    if num_heads is not None and len(num_heads) != stage_count:
         raise ValueError(f"num_heads must have {stage_count} entries, got {len(num_heads)}.")
     pruning = {}
     for name, stage, block in blocks:
-        attention: SerializedAttention = block.attn
-        proj = attention.proj
-        statistics = collect_input_statistics(proj, run_model, frames)
-        gram = head_gram(
-            proj.weight,
-            statistics.second_moment / statistics.count,
-            attention.num_heads,
-            attention.head_dim,
-        )
-        heads = select_heads(gram, num_heads[stage])
-        columns = head_columns(heads, attention.head_dim)
-        weight, bias = refit_linear(proj.weight, proj.bias, statistics, columns, damp)
-        proj.weight.zero_()
-        proj.weight[:, columns] = weight
-        proj.bias.copy_(bias)
-        pruning[name] = AttentionPruning(heads, attention.num_heads, attention.head_dim)
-        logger.info(
-            "%s: kept heads %s of %d (%d tokens)",
-            name,
-            heads,
-            attention.num_heads,
-            statistics.count,
-        )
+        attention_pruning = None
+        if num_heads is not None:
+            attention: SerializedAttention = block.attn
+            proj = attention.proj
+            statistics = collect_input_statistics(proj, run_model, frames)
+            gram = head_gram(
+                proj.weight,
+                statistics.second_moment / statistics.count,
+                attention.num_heads,
+                attention.head_dim,
+            )
+            heads = select_heads(gram, num_heads[stage])
+            _refit_masked(proj, statistics, head_columns(heads, attention.head_dim), damp)
+            attention_pruning = AttentionPruning(heads, attention.num_heads, attention.head_dim)
+            logger.info(
+                "%s: kept heads %s of %d (%d tokens)",
+                name,
+                heads,
+                attention.num_heads,
+                statistics.count,
+            )
+        hidden_units = None
+        if mlp_ratio is not None:
+            fc2 = block.mlp.get_submodule("0.fc2")
+            statistics = collect_input_statistics(fc2, run_model, frames)
+            hidden_units = select_hidden_units(
+                fc2.weight,
+                statistics.second_moment / statistics.count,
+                int(fc2.out_features * mlp_ratio),
+            )
+            _refit_masked(fc2, statistics, hidden_units, damp)
+            logger.info(
+                "%s: kept %d of %d MLP hidden units (%d tokens)",
+                name,
+                len(hidden_units),
+                fc2.in_features,
+                statistics.count,
+            )
+        pruning[name] = BlockPruning(attention_pruning, hidden_units)
     return pruning
 
 
 def slice_pruned_state_dict(
     state_dict: Mapping[str, torch.Tensor],
     masked_encoder: nn.Module,
-    pruning: Mapping[str, AttentionPruning],
+    pruning: Mapping[str, BlockPruning],
     prefix: str = "encoder.",
 ) -> dict[str, torch.Tensor]:
     """Return the state dict of the pruned model.
 
-    ``qkv`` keeps the rows of the kept heads of ``state_dict``. ``proj`` takes the refit
-    weights of ``masked_encoder`` on the kept heads' columns. Every other tensor is copied.
+    ``qkv`` keeps the rows of the kept heads of ``state_dict`` and ``fc1`` those of the kept
+    hidden units. ``proj`` and ``fc2`` take the refit weights of ``masked_encoder`` on the kept
+    columns. Every other tensor is copied.
 
     Args:
         state_dict: State dict of the unpruned model.
-        masked_encoder: Encoder pruned by :func:`prune_encoder_heads`.
-        pruning: Kept heads by block name, relative to the encoder.
+        masked_encoder: Encoder pruned by :func:`prune_encoder`.
+        pruning: Kept units by block name, relative to the encoder.
         prefix: Key prefix of the encoder inside ``state_dict``.
 
     Returns:
@@ -422,7 +503,18 @@ def slice_pruned_state_dict(
     """
     pruned = {key: tensor.detach().cpu().clone() for key, tensor in state_dict.items()}
     modules = dict(masked_encoder.named_modules())
-    for name, kept in pruning.items():
+    for name, block in pruning.items():
+        if block.hidden_units is not None:
+            key = f"{prefix}{name}.mlp.0"
+            units = torch.as_tensor(block.hidden_units, dtype=torch.long)
+            pruned[f"{key}.fc1.weight"] = pruned[f"{key}.fc1.weight"][units].contiguous()
+            pruned[f"{key}.fc1.bias"] = pruned[f"{key}.fc1.bias"][units].contiguous()
+            fc2 = modules[f"{name}.mlp.0.fc2"]
+            pruned[f"{key}.fc2.weight"] = fc2.weight.detach()[:, units].cpu().contiguous()
+            pruned[f"{key}.fc2.bias"] = fc2.bias.detach().cpu().clone()
+        kept = block.attention
+        if kept is None:
+            continue
         key = f"{prefix}{name}.attn"
         heads = torch.as_tensor(kept.heads, dtype=torch.long)
         qkv_weight = pruned[f"{key}.qkv.weight"]
@@ -468,19 +560,44 @@ def calibration_frame_indices(scene_groups: Sequence[Sequence[int]], num_frames:
     return indices
 
 
-def pruned_model_overrides(pruning: Mapping[str, AttentionPruning], stage_count: int) -> list[str]:
-    """Return the Hydra overrides that build the pruned encoder."""
-    heads = [0] * stage_count
-    head_dims: list[int | None] = [None] * stage_count
-    for name, kept in pruning.items():
-        stage = int(_BLOCK_NAME.match(name)["stage"])
-        heads[stage] = len(kept.heads)
-        head_dims[stage] = kept.head_dim
-    head_dim = head_dims[0] if len(set(head_dims)) == 1 else f"[{','.join(map(str, head_dims))}]"
-    return [
-        f"model.encoder.enc_num_head=[{','.join(map(str, heads))}]",
-        f"+model.encoder.enc_head_dim={head_dim}",
-    ]
+def pruned_model_overrides(
+    pruning: Mapping[str, BlockPruning],
+    mlp_ratio: float | None = None,
+    seg3d_head_mlp_ratio: float | None = None,
+) -> list[str]:
+    """Return the Hydra overrides that build the pruned encoder.
+
+    Args:
+        pruning: Kept units by block name, every stage's blocks included.
+        mlp_ratio: Target MLP expansion ratio, or ``None`` when the MLP is not pruned.
+        seg3d_head_mlp_ratio: Trained MLP ratio of a seg3d head that reads the encoder's, to pin
+            it back, or ``None`` without such a head.
+
+    Returns:
+        The overrides.
+    """
+    overrides = []
+    attention = {
+        int(_BLOCK_NAME.match(name)["stage"]): block.attention
+        for name, block in pruning.items()
+        if block.attention is not None
+    }
+    if attention:
+        stage_count = max(attention) + 1
+        heads = [len(attention[stage].heads) for stage in range(stage_count)]
+        head_dims = [attention[stage].head_dim for stage in range(stage_count)]
+        head_dim = (
+            head_dims[0] if len(set(head_dims)) == 1 else f"[{','.join(map(str, head_dims))}]"
+        )
+        overrides += [
+            f"model.encoder.enc_num_head=[{','.join(map(str, heads))}]",
+            f"+model.encoder.enc_head_dim={head_dim}",
+        ]
+    if mlp_ratio is not None:
+        overrides.append(f"model.encoder.mlp_ratio={mlp_ratio}")
+        if seg3d_head_mlp_ratio is not None:
+            overrides.append(f"model.seg3d_head.mlp_ratio={seg3d_head_mlp_ratio}")
+    return overrides
 
 
 def _use_strict_fp32() -> None:
@@ -585,23 +702,27 @@ def _load_calibration_inputs(
 
 @hydra.main(version_base=None, config_path=_CONFIG_PATH)
 def main(cfg: DictConfig) -> None:
-    """Prune the attention heads of a trained PTv3 encoder and write the pruned checkpoint.
+    """Prune a trained PTv3 encoder and write the pruned checkpoint.
 
     Args:
         cfg: Hydra configuration with one ``weights`` path and the ``prune`` options.
 
     Raises:
-        ValueError: If not exactly one weights path or no ``prune.output`` and
-            ``prune.num_heads`` are given.
+        ValueError: If not exactly one weights path, no ``prune.output`` or neither
+            ``prune.num_heads`` nor ``prune.mlp_ratio`` is given.
         NotImplementedError: If the configured model is not a PTv3 model.
     """
     options = cfg.get("prune", None) or {}
     weights = resolve_weights_paths(cfg)
     if weights is None or len(weights) != 1:
         raise ValueError("Pass exactly one checkpoint: '++weights=[<path>]'.")
-    if options.get("output") is None or options.get("num_heads") is None:
-        raise ValueError("Pass '+prune.output=<path>' and '+prune.num_heads=[...]'.")
-    num_heads = [int(value) for value in options["num_heads"]]
+    if options.get("output") is None:
+        raise ValueError("Pass '+prune.output=<path>'.")
+    if options.get("num_heads") is None and options.get("mlp_ratio") is None:
+        raise ValueError("Pass '+prune.num_heads=[...]', '+prune.mlp_ratio=<ratio>' or both.")
+    num_heads = options.get("num_heads")
+    num_heads = None if num_heads is None else [int(value) for value in num_heads]
+    mlp_ratio = options.get("mlp_ratio")
     num_frames = int(options.get("num_frames", 256))
     calibration_split = SplitType(options.get("calibration_split", "train"))
     damp = float(options.get("damp", 0.01))
@@ -635,16 +756,16 @@ def main(cfg: DictConfig) -> None:
     # The export copy may fold some layers; the pruned ones must still be the trained ones.
     trained = model.encoder.state_dict()
     for name, value in export_module.encoder.state_dict().items():
-        if name.endswith(
-            ("attn.qkv.weight", "attn.qkv.bias", "attn.proj.weight", "attn.proj.bias")
-        ):
+        if name.endswith(_PRUNED_LAYERS):
             if not torch.equal(value, trained[name]):
                 raise RuntimeError(f"The export copy changed {name}.")
 
     def run_model(frame: tuple[torch.Tensor, ...]) -> object:
         return export_module(*(arg.to(device) for arg in frame))
 
-    pruning = prune_encoder_heads(export_module.encoder, num_heads, run_model, frames, damp)
+    pruning = prune_encoder(
+        export_module.encoder, run_model, frames, damp, num_heads=num_heads, mlp_ratio=mlp_ratio
+    )
     checkpoint = torch.load(weights[0], map_location="cpu", weights_only=False)
     if set(checkpoint["state_dict"]) != set(model.state_dict()):
         raise ValueError("The checkpoint does not hold exactly the tensors of the model.")
@@ -657,13 +778,23 @@ def main(cfg: DictConfig) -> None:
         checkpoint["state_dict"], export_module.encoder, pruning
     )
     payload["autoware_ml_prune"] = {
-        "type": "ptv3_encoder_oneshot_heads",
+        "type": "ptv3_encoder_oneshot",
         "num_heads": num_heads,
+        "mlp_ratio": mlp_ratio,
         "calibration_config": options.get("calibration_config"),
         "calibration_split": calibration_split.value,
         "num_frames": len(frames),
         "damp": damp,
-        "kept_heads": {name: kept.heads for name, kept in pruning.items()},
+        "kept_heads": {
+            name: block.attention.heads
+            for name, block in pruning.items()
+            if block.attention is not None
+        },
+        "kept_hidden_units": {
+            name: block.hidden_units
+            for name, block in pruning.items()
+            if block.hidden_units is not None
+        },
     }
     output = Path(options["output"])
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -671,7 +802,13 @@ def main(cfg: DictConfig) -> None:
     logger.info(
         "Wrote %s. Build the pruned model with: %s",
         output,
-        " ".join(pruned_model_overrides(pruning, len(num_heads))),
+        " ".join(
+            pruned_model_overrides(
+                pruning,
+                mlp_ratio,
+                OmegaConf.select(cfg, "model.seg3d_head.mlp_ratio", default=None),
+            )
+        ),
     )
 
 

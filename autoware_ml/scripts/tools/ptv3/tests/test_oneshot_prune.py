@@ -39,10 +39,11 @@ from autoware_ml.scripts.tools.ptv3.oneshot_prune import (
     collect_input_statistics,
     head_columns,
     head_gram,
-    prune_encoder_heads,
+    prune_encoder,
     pruned_model_overrides,
     refit_linear,
     select_heads,
+    select_hidden_units,
     slice_pruned_state_dict,
 )
 
@@ -132,13 +133,18 @@ def _trained_encoder() -> _Encoder:
     return _Encoder().eval()
 
 
-def _first_heads_pruning(encoder: _Encoder, num_heads: Sequence[int]) -> None:
-    """Drop all but the first heads of every block, without a refit (the control)."""
+def _first_units_pruning(
+    encoder: _Encoder, num_heads: Sequence[int] | None, mlp_ratio: float | None
+) -> None:
+    """Drop all but the first heads or hidden units of every block, without a refit."""
     with torch.no_grad():
         for stage_index, stage in enumerate(encoder.enc.values()):
             for block in stage.values():
-                keep = num_heads[stage_index] * block.attn.head_dim
-                block.attn.proj.weight[:, keep:] = 0.0
+                if num_heads is not None:
+                    keep = num_heads[stage_index] * block.attn.head_dim
+                    block.attn.proj.weight[:, keep:] = 0.0
+                if mlp_ratio is not None:
+                    block.mlp.get_submodule("0.fc2").weight[:, int(CHANNELS * mlp_ratio) :] = 0.0
 
 
 def test_statistics_accumulate_every_token_in_float64() -> None:
@@ -171,7 +177,7 @@ def test_statistics_accumulate_every_token_in_float64() -> None:
 def test_refit_with_nothing_dropped_is_the_identity() -> None:
     """
     Input: a linear layer refit on all of its input columns, also inside the encoder pruned to
-        its trained head counts.
+        its trained head counts and MLP ratio.
     Expected: the weights, the bias and the encoder outputs are unchanged.
     Check: allclose at fp32 rounding.
     """
@@ -186,55 +192,100 @@ def test_refit_with_nothing_dropped_is_the_identity() -> None:
     encoder = _trained_encoder()
     reference = copy.deepcopy(encoder)
     frames = _frames(4, seed=1)
-    pruning = prune_encoder_heads(encoder, [4, 2], encoder, frames, damp=0.01)
+    pruning = prune_encoder(encoder, encoder, frames, 0.01, num_heads=[4, 2], mlp_ratio=4.0)
 
-    assert [kept.heads for kept in pruning.values()] == [[0, 1, 2, 3]] * 2 + [[0, 1]] * 2
+    assert [block.attention.heads for block in pruning.values()] == [[0, 1, 2, 3]] * 2 + [
+        [0, 1]
+    ] * 2
+    assert [block.hidden_units for block in pruning.values()] == [list(range(64))] * 4
     with torch.no_grad():
         for frame in frames:
             torch.testing.assert_close(encoder(frame), reference(frame), rtol=1e-5, atol=1e-5)
 
 
-def test_sliced_model_equals_the_masked_model() -> None:
+_SHAPES = [
+    pytest.param(
+        [2, 1],
+        None,
+        ["model.encoder.enc_num_head=[2,1]", "+model.encoder.enc_head_dim=[4,8]"],
+        id="heads",
+    ),
+    pytest.param(
+        None,
+        3.0,
+        ["model.encoder.mlp_ratio=3.0", "model.seg3d_head.mlp_ratio=4"],
+        id="mlp",
+    ),
+    pytest.param(
+        [2, 1],
+        2.5,
+        [
+            "model.encoder.enc_num_head=[2,1]",
+            "+model.encoder.enc_head_dim=[4,8]",
+            "model.encoder.mlp_ratio=2.5",
+            "model.seg3d_head.mlp_ratio=4",
+        ],
+        id="heads+mlp",
+    ),
+]
+
+
+@pytest.mark.parametrize(("num_heads", "mlp_ratio", "overrides"), _SHAPES)
+def test_sliced_model_equals_the_masked_model(
+    num_heads: list[int] | None, mlp_ratio: float | None, overrides: list[str]
+) -> None:
     """
-    Input: the encoder pruned to 2 / 1 heads as a mask, and its pruned state dict loaded into
-        an encoder built with those head counts at the trained head widths 4 / 8.
-    Expected: the two encoders compute the same function.
+    Input: the encoder pruned as a mask to 2 / 1 heads, to a narrower MLP or both, and its
+        pruned state dict loaded into an encoder built with those head counts at the trained
+        head widths 4 / 8 and that MLP ratio.
+    Expected: the two encoders compute the same function; the overrides name that encoder.
     Check: strict load, and outputs equal within 1e-5 on new frames.
     """
     encoder = _trained_encoder()
-    pruning = prune_encoder_heads(encoder, [2, 1], encoder, _frames(8, seed=1), damp=0.01)
+    pruning = prune_encoder(
+        encoder, encoder, _frames(8, seed=1), 0.01, num_heads=num_heads, mlp_ratio=mlp_ratio
+    )
     state = slice_pruned_state_dict(encoder.state_dict(), encoder, pruning, prefix="")
-    sliced = _Encoder(num_heads=(2, 1), head_dim=(4, 8)).eval()
+    sliced = _Encoder(
+        num_heads=num_heads or (4, 2),
+        head_dim=(4, 8) if num_heads else (None, None),
+        mlp_ratio=mlp_ratio or 4.0,
+    ).eval()
     sliced.load_state_dict(state, strict=True)
 
-    assert pruned_model_overrides(pruning, 2) == [
-        "model.encoder.enc_num_head=[2,1]",
-        "+model.encoder.enc_head_dim=[4,8]",
-    ]
+    assert pruned_model_overrides(pruning, mlp_ratio, seg3d_head_mlp_ratio=4) == overrides
     with torch.no_grad():
         for frame in _frames(4, seed=2):
             torch.testing.assert_close(sliced(frame), encoder(frame), rtol=1e-5, atol=1e-5)
 
 
-def test_refit_reduces_the_output_error_of_first_heads_pruning() -> None:
+@pytest.mark.parametrize(
+    ("num_heads", "mlp_ratio", "layer"),
+    [([2, 1], None, "attn.proj"), (None, 2.0, "mlp.0.fc2")],
+    ids=["heads", "mlp"],
+)
+def test_refit_reduces_the_output_error_of_first_units_pruning(
+    num_heads: list[int] | None, mlp_ratio: float | None, layer: str
+) -> None:
     """
-    Input: the encoder pruned to 2 / 1 heads by selection plus refit, and by keeping the first
-        heads without a refit, on random correlated frames.
-    Expected: the refit is closer to the unpruned encoder, both at the attention output of the
-        first block on the calibration frames (guaranteed by the least-squares fit) and at
-        the encoder output on new frames.
+    Input: the encoder pruned to 2 / 1 heads or to half the MLP hidden units by selection plus
+        refit, and by keeping the first heads or units without a refit, on random correlated
+        frames.
+    Expected: the refit is closer to the unpruned encoder, both at the pruned layer's output
+        in the first block on the calibration frames and at the encoder output on new frames.
     Check: the summed squared errors.
     """
     reference = _trained_encoder()
     calibration = _frames(16, seed=1)
     refit = copy.deepcopy(reference)
-    prune_encoder_heads(refit, [2, 1], refit, calibration, damp=0.01)
+    prune_encoder(refit, refit, calibration, 0.01, num_heads=num_heads, mlp_ratio=mlp_ratio)
     first = copy.deepcopy(reference)
-    _first_heads_pruning(first, [2, 1])
+    _first_units_pruning(first, num_heads, mlp_ratio)
 
-    def attention_output(encoder: _Encoder, frame: torch.Tensor) -> torch.Tensor:
+    def layer_output(encoder: _Encoder, frame: torch.Tensor) -> torch.Tensor:
         outputs = []
-        handle = encoder.enc.enc0.block0.attn.proj.register_forward_hook(
+        module = encoder.enc.enc0.block0.get_submodule(layer)
+        handle = module.register_forward_hook(
             lambda _module, _inputs, output: outputs.append(output)
         )
         encoder(frame)
@@ -248,11 +299,24 @@ def test_refit_reduces_the_output_error_of_first_heads_pruning() -> None:
                 for frame in frames
             )
 
-    assert error(refit, calibration, attention_output) < 0.5 * error(
-        first, calibration, attention_output
-    )
+    assert error(refit, calibration, layer_output) < 0.5 * error(first, calibration, layer_output)
     held_out = _frames(8, seed=2)
     assert error(refit, held_out, _Encoder.__call__) < error(first, held_out, _Encoder.__call__)
+
+
+def test_hidden_unit_selection_keeps_the_highest_wanda_scores() -> None:
+    """
+    Input: a layer over 4 hidden units whose column norms and input energies give the scores
+        4, 1, 9 and 0.25.
+    Expected: keeping 2 units keeps units 0 and 2, ascending.
+    Check: the kept units, and the error for an impossible count.
+    """
+    weight = torch.tensor([[2.0, 1.0, 0.0, 0.5], [0.0, 0.0, 1.0, 0.0]])
+    second_moment = torch.diag(torch.tensor([1.0, 1.0, 9.0, 1.0]))
+
+    assert select_hidden_units(weight, second_moment, 2) == [0, 2]
+    with pytest.raises(ValueError, match="Cannot keep"):
+        select_hidden_units(weight, second_moment, 5)
 
 
 def test_head_selection_minimises_the_dropped_energy() -> None:
