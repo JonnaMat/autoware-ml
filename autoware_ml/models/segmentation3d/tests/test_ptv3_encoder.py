@@ -27,7 +27,10 @@ import torch.nn as nn
 
 import autoware_ml.utils.point_cloud.structures as point_structures
 from autoware_ml.preprocessing.data_preprocessor import DataPreprocessor
-from autoware_ml.utils.point_cloud.structures import pooled_sparse_shape
+from autoware_ml.utils.point_cloud.structures import (
+    pooled_sparse_shape,
+    serialize_point_cloud_batch,
+)
 from autoware_ml.dataclasses.batch.segmentation3d import Segmentation3DGTBatch
 from autoware_ml.dataclasses.geometry.voxels import VoxelsData
 from autoware_ml.dataclasses.models.model_batch_inputs import ModelBatchInputs
@@ -69,6 +72,7 @@ from autoware_ml.models.segmentation3d.ptv3 import PTv3Segmentation3DModel
 from autoware_ml.models.segmentation3d.ptv3_base import (
     build_ptv3_encoder_dynamic_axes,
     build_ptv3_export_context,
+    build_serialized_pooling_metadata,
     export_patch_sizes,
     prepare_ptv3_export_inputs,
     require_single_sample_export_batch,
@@ -989,6 +993,62 @@ def test_serialized_pooling_export_mode_rejects_shuffle_orders() -> None:
     pooling.export_mode = True
     with pytest.raises(ValueError, match="shuffle_orders"):
         pooling(Point())
+
+
+@pytest.mark.parametrize(
+    ("count", "extent", "duplicates", "patch_size"),
+    [(300, 32, 0, 16), (300, 32, 40, 16), (37, 64, 0, 64), (1, 8, 0, 4), (500, 1024, 0, 48)],
+)
+def test_pooled_levels_list_their_voxels_in_order_zero(
+    count: int, extent: int, duplicates: int, patch_size: int
+) -> None:
+    """Every pooled level is listed in ascending order-0 code, so its order 0 is the identity.
+
+    A pooled voxel is a run of the input level walked in order 0, and ``code >> 3 * depth`` is
+    monotone, so the runs come out in strictly ascending order-0 code whatever the input level's
+    voxel order, duplicates or size. At every pooled level the order-0 ``serialized_inverse`` row
+    is then ``arange``, the order-0 ``patch_order`` row starts with ``arange`` and the next pooling
+    gathers nothing (``indices`` is ``arange``). The deployed runtime (``autoware_ptv3``,
+    ``fillPoolingStageKernel``) writes these rows as the identity, and graph rewrites may drop or
+    slice the gathers they feed, so this contract must not change silently.
+    """
+    generator = torch.Generator().manual_seed(count + extent + duplicates)
+    grid_coord = torch.randint(0, extent, (count, 3), generator=generator)
+    if duplicates:
+        grid_coord = torch.cat([grid_coord, grid_coord[:duplicates]])
+    # The input level's voxel order is arbitrary (the training voxelizer does not sort).
+    grid_coord = grid_coord[torch.randperm(len(grid_coord), generator=generator)]
+    point, _ = serialize_point_cloud_batch(
+        {
+            "coord": grid_coord.float(),
+            "feat": grid_coord.float(),
+            "grid_coord": grid_coord,
+            "offset": torch.tensor([len(grid_coord)]),
+        },
+        PTv3Segmentation3DModel.EXPORT_ORDER,
+        torch.tensor(int(extent - 1).bit_length()),
+    )
+    strides = [2, 2, 2, 2]
+    metadata = build_serialized_pooling_metadata(
+        point["grid_coord"],
+        point["serialized_code"],
+        point["serialized_order"],
+        strides,
+        [patch_size] * (len(strides) + 1),
+    )
+
+    for stage, meta in enumerate(metadata):
+        pooled_count = len(meta.grid_coord)
+        identity = torch.arange(pooled_count)
+        assert torch.equal(meta.serialized_inverse[0], identity), f"stage {stage}"
+        assert torch.equal(meta.patch_order[0, :pooled_count], identity), f"stage {stage}"
+        assert torch.equal(meta.patch_order[0], build_patch_order(identity[None], patch_size)[0]), (
+            f"stage {stage}"
+        )
+        if stage > 0:
+            assert torch.equal(meta.indices, torch.arange(len(meta.indices))), f"stage {stage}"
+        # The second order stays a real permutation, so the check above is not vacuous.
+        assert torch.equal(torch.sort(meta.serialized_inverse[1]).values, identity)
 
 
 def _reference_patch_order(serialized_order: torch.Tensor, patch_size: int) -> torch.Tensor:
