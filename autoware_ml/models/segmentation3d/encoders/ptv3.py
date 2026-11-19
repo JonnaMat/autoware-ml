@@ -803,6 +803,7 @@ class Block(PointModule):
         enable_attn: bool = True,
         rope_base: float | None = None,
         head_dim: int | None = None,
+        enable_attn_branch: bool = True,
     ) -> None:
         """Initialize one PTv3 attention block.
 
@@ -834,6 +835,11 @@ class Block(PointModule):
                 ``None`` to disable it.
             head_dim: Per-head attention width, or ``None`` for
                 ``channels // num_heads``. See :class:`SerializedAttention`.
+            enable_attn_branch: Whether a block with ``enable_attn`` keeps its
+                attention residual branch (``norm1`` + attention). When
+                disabled the block keeps its convolution and MLP branches and
+                the attention branch is the identity (``x + 0``). Default
+                ``True`` leaves the block unchanged.
 
         Raises:
             ValueError: Raised when the block would carry no operation at all.
@@ -858,6 +864,7 @@ class Block(PointModule):
             self.cpe = None
             self.norm0 = PointSequential(nn.LayerNorm(channels))
 
+        self.enable_attn_branch = bool(enable_attn_branch)
         if self.enable_attn:
             self.norm1 = PointSequential(nn.LayerNorm(channels))
             self.attn = SerializedAttention(
@@ -876,6 +883,9 @@ class Block(PointModule):
                 rope_base=rope_base,
                 head_dim=head_dim,
             )
+            if not self.enable_attn_branch:
+                self.norm1 = None
+                self.attn = None
             self.norm2 = PointSequential(nn.LayerNorm(channels))
             self.mlp = PointSequential(MLP(channels, mlp_ratio, proj_drop))
         else:
@@ -916,13 +926,14 @@ class Block(PointModule):
             point = self.norm0(point)
 
         if self.enable_attn:
-            shortcut = point.feat
-            if self.pre_norm:
-                point = self.norm1(point)
-            point = self.drop_path(self.attn(point))
-            point.feat = shortcut + point.feat
-            if not self.pre_norm:
-                point = self.norm1(point)
+            if self.attn is not None:
+                shortcut = point.feat
+                if self.pre_norm:
+                    point = self.norm1(point)
+                point = self.drop_path(self.attn(point))
+                point.feat = shortcut + point.feat
+                if not self.pre_norm:
+                    point = self.norm1(point)
 
             shortcut = point.feat
             if self.pre_norm:
@@ -1286,6 +1297,7 @@ class PointTransformerV3Encoder(PointModule):
         enc_attn: Sequence[bool] | bool = True,
         enc_rope_base: Sequence[float | None] | float | None = None,
         enc_head_dim: Sequence[int | None] | int | None = None,
+        enc_attn_branch: Sequence[bool] | bool = True,
     ) -> None:
         """Initialize the PTv3 encoder.
 
@@ -1325,6 +1337,11 @@ class PointTransformerV3Encoder(PointModule):
                 (e.g. 16 with halved ``enc_num_head``) narrows the attention
                 inner width to ``enc_num_head[i] * enc_head_dim[i]`` while the
                 stage width stays ``enc_channels[i]``.
+            enc_attn_branch: Per-stage flag, or one flag for every stage: keep
+                the attention residual branch (``norm1`` + attention) of the
+                stage's blocks. ``False`` removes only that branch and keeps the
+                convolution and MLP branches (``enc_attn=False`` removes the
+                MLP too). Default ``True`` leaves the encoder unchanged.
         """
         super().__init__()
         self.in_channels = in_channels
@@ -1338,6 +1355,9 @@ class PointTransformerV3Encoder(PointModule):
         self.enc_attn = expand_stage_flags(enc_attn, stage_count, True, "enc_attn")
         self.enc_rope_base = expand_stage_flags(enc_rope_base, stage_count, None, "enc_rope_base")
         self.enc_head_dim = expand_stage_flags(enc_head_dim, stage_count, None, "enc_head_dim")
+        self.enc_attn_branch = expand_stage_flags(
+            enc_attn_branch, stage_count, True, "enc_attn_branch"
+        )
         self.embedding = Embedding(
             in_channels, enc_channels[0], kernel_size=stem_kernel_size, stem_type=stem_type
         )
@@ -1379,6 +1399,7 @@ class PointTransformerV3Encoder(PointModule):
                         enable_attn=self.enc_attn[stage_index],
                         rope_base=self.enc_rope_base[stage_index],
                         head_dim=self.enc_head_dim[stage_index],
+                        enable_attn_branch=self.enc_attn_branch[stage_index],
                     ),
                     name=f"block{block_index}",
                 )
