@@ -514,6 +514,31 @@ class Point3DRoPE(nn.Module):
         return rotated_query, rotated_key
 
 
+def token_merge_constants(
+    patch_size: int, stride: int, device: torch.device | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the constants of the static in-patch token merge.
+
+    Destinations are the tokens ``0, s, 2s, ...`` of a patch, ``ceil(patch_size / s)`` of them.
+
+    Args:
+        patch_size: Tokens per attention patch.
+        stride: Merge stride ``s``.
+        device: Device of the returned tensors.
+
+    Returns:
+        ``slots`` (int64 ``[D]``, ``0..D-1``) for the one-hot of the argmax, and ``self_bonus``
+        (float32 ``[patch_size, D]``, 4 where token ``i`` is destination ``j``, i.e.
+        ``i == j * s``, else 0). Adding the bonus to cosine similarities (at most 1) makes
+        every destination pick itself, so no destination is ever empty.
+    """
+    slot_count = math.ceil(patch_size / stride)
+    slots = torch.arange(slot_count, dtype=torch.int64, device=device)
+    tokens = torch.arange(patch_size, dtype=torch.int64, device=device)
+    self_bonus = (tokens[:, None] == slots[None, :] * stride).to(torch.float32) * 4.0
+    return slots, self_bonus
+
+
 class SerializedAttention(PointModule):
     """Apply windowed self-attention over serialized point tokens.
 
@@ -536,6 +561,10 @@ class SerializedAttention(PointModule):
         upcast_attention: bool,
         upcast_softmax: bool,
         rope_base: float | None = None,
+        merge_stride: int | None = None,
+        merge_size_bias: bool = False,
+        kv_pool: int | None = None,
+        kv_pool_split_gemm: bool = False,
     ) -> None:
         """Initialize serialized attention.
 
@@ -555,8 +584,34 @@ class SerializedAttention(PointModule):
             rope_base: Frequency base for axis-split 3D rotary embedding over
                 voxel coordinates. ``None`` disables RoPE, which is the PTv3
                 default and leaves the attention path unchanged.
+            merge_stride: Static token merge of keys and values inside each patch
+                (latency experiment, untrained): every ``merge_stride``-th token of a
+                patch is a destination, every token joins its most cosine-similar
+                destination (per head, on the keys), and keys and values become the
+                size-weighted mean per destination. Queries stay per token, so the
+                output needs no unmerge. ``None`` (default) disables it and leaves the
+                attention path unchanged. Only the non-flash (export) path supports it.
+            merge_size_bias: Add ``log(size)`` of each merged token to the attention
+                logits (ToMe proportional attention). Needs ``merge_stride``.
+            kv_pool: Spatial-reduction attention inside each patch (PVT-style, latency
+                experiment, untrained): keys and values are averaged over every
+                ``kv_pool`` consecutive tokens in serialized order; queries stay per
+                token. ``None`` (default) disables it. Non-flash (export) path only.
+            kv_pool_split_gemm: With ``kv_pool``, project queries from all tokens and
+                keys/values from the pooled input (a narrower key/value Gemm). Equal to
+                pooling after the projection, since the projection is affine.
         """
         super().__init__()
+        if kv_pool is not None and kv_pool < 1:
+            raise ValueError("kv_pool must be a positive integer or None.")
+        if kv_pool_split_gemm and kv_pool is None:
+            raise ValueError("kv_pool_split_gemm needs kv_pool.")
+        if kv_pool is not None and (merge_stride is not None or rope_base is not None):
+            raise ValueError("kv_pool cannot be combined with merge_stride or RoPE.")
+        if merge_stride is not None and merge_stride < 1:
+            raise ValueError("merge_stride must be a positive integer or None.")
+        if merge_size_bias and merge_stride is None:
+            raise ValueError("merge_size_bias needs merge_stride.")
         if channels % num_heads != 0:
             raise ValueError("channels must be divisible by num_heads")
         if enable_flash and enable_rpe:
@@ -587,7 +642,89 @@ class SerializedAttention(PointModule):
         self.softmax = nn.Softmax(dim=-1)
         self.rpe = RelativePositionEncoding(patch_size, num_heads) if enable_rpe else None
         self.rope = Point3DRoPE(channels // num_heads, rope_base) if rope_base is not None else None
+        self.merge_stride = merge_stride
+        self.merge_size_bias = merge_size_bias
+        self.kv_pool = kv_pool
+        self.kv_pool_split_gemm = kv_pool_split_gemm
+        if merge_stride is not None:
+            slots, self_bonus = token_merge_constants(patch_size, merge_stride)
+            # Non-persistent: no checkpoint entry; they become graph initializers on export.
+            self.register_buffer("merge_slots", slots, persistent=False)
+            self.register_buffer("merge_self_bonus", self_bonus, persistent=False)
         self.flash_attn = None
+
+    def _pooled_kv_attention(
+        self, tokens: torch.Tensor, patch_size: int, head_count: int, head_dim: int
+    ) -> torch.Tensor:
+        """Attention of every token over keys/values pooled by ``kv_pool`` inside its patch.
+
+        Args:
+            tokens: Serialized, patch-padded features ``[P * T, C]``.
+            patch_size: ``T``.
+            head_count: ``H``.
+            head_dim: ``d``.
+
+        Returns:
+            Attention output ``[P * T, C]`` in the serialized patch order.
+        """
+        pool, channels = self.kv_pool, self.channels
+        if self.kv_pool_split_gemm:
+            weight, bias = self.qkv.weight, self.qkv.bias
+            q = nn.functional.linear(
+                tokens, weight[:channels], None if bias is None else bias[:channels]
+            )
+            pooled = tokens.reshape(-1, pool, channels).mean(dim=1)
+            kv = nn.functional.linear(
+                pooled, weight[channels:], None if bias is None else bias[channels:]
+            )
+        else:
+            qkv = self.qkv(tokens)
+            q, kv = qkv[:, :channels], qkv[:, channels:]
+            kv = kv.reshape(-1, pool, 2 * channels).mean(dim=1)
+        q = q.reshape(-1, patch_size, head_count, head_dim).permute(0, 2, 1, 3)
+        kv = kv.reshape(-1, patch_size // pool, 2, head_count, head_dim)
+        k, v = kv.permute(2, 0, 3, 1, 4).unbind(dim=0)
+        if self.upcast_attention:
+            q = q.float()
+            k = k.float()
+        attention = (q * self.scale) @ k.transpose(-2, -1)
+        if self.upcast_softmax:
+            attention = attention.float()
+        attention = self.softmax(attention)
+        attention = self.attn_drop(attention).to(v.dtype)
+        return (attention @ v).transpose(1, 2).reshape(-1, channels)
+
+    def _merge_key_value(
+        self, k: torch.Tensor, v: torch.Tensor, patch_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Merge keys and values of every patch onto its fixed destination tokens.
+
+        Static shapes only: a strided slice picks the destinations, ArgMax + Equal against
+        the constant slot index builds the one-hot assignment, and two batched matmuls
+        form the size-weighted means. No scatter, sort or randomness.
+
+        Args:
+            k: Keys ``[P, H, T, d]``.
+            v: Values ``[P, H, T, d]``.
+            patch_size: ``T``.
+
+        Returns:
+            Merged keys and values ``[P, H, D, d]`` with ``D = ceil(T / s)``, and the
+            ``log(size)`` logit bias ``[P, H, 1, D]`` or ``None``.
+        """
+        stride = self.merge_stride
+        if patch_size == self.patch_size_max:
+            slots, self_bonus = self.merge_slots, self.merge_self_bonus
+        else:
+            slots, self_bonus = token_merge_constants(patch_size, stride, k.device)
+        unit = torch.nn.functional.normalize(k, dim=-1)
+        similarity = unit @ unit[:, :, ::stride].transpose(-2, -1)
+        similarity = similarity + self_bonus
+        assignment = (similarity.argmax(dim=-1, keepdim=True) == slots).to(k.dtype)
+        size = assignment.sum(dim=-2, keepdim=True)
+        weights = (assignment / size).transpose(-2, -1)
+        bias = size.log() if self.merge_size_bias else None
+        return weights @ k, weights @ v, bias
 
     @torch.no_grad()
     def _get_padding_and_inverse(
@@ -666,8 +803,17 @@ class SerializedAttention(PointModule):
             pad, unpad, cu_seqlens = self._get_padding_and_inverse(point)
             order = point.serialized_order[self.order_index][pad]
             inverse = unpad[point.serialized_inverse[self.order_index]]
-        qkv = self.qkv(point.feat[order])
         head_dim = channel_count // head_count
+        if self.kv_pool is not None:
+            if self.enable_flash:
+                raise NotImplementedError("kv_pool runs only on the non-flash path.")
+            if patch_size % self.kv_pool:
+                raise ValueError("kv_pool must divide the patch size.")
+            feat = self._pooled_kv_attention(point.feat[order], patch_size, head_count, head_dim)
+            feat = feat[inverse]
+            point.feat = self.proj_drop(self.proj(feat))
+            return point
+        qkv = self.qkv(point.feat[order])
 
         # With RoPE the projection has to be split before attention so queries
         # and keys can be rotated by their voxel positions; without it the
@@ -687,10 +833,17 @@ class SerializedAttention(PointModule):
                     tensor.reshape(-1, patch_size, head_count, head_dim).permute(0, 2, 1, 3)
                     for tensor in roped
                 )
+            merge_bias = None
+            if self.merge_stride is not None:
+                if self.rpe is not None:
+                    raise NotImplementedError("Token merging does not support RPE.")
+                k, v, merge_bias = self._merge_key_value(k, v, patch_size)
             if self.upcast_attention:
                 q = q.float()
                 k = k.float()
             attention = (q * self.scale) @ k.transpose(-2, -1)
+            if merge_bias is not None:
+                attention = attention + merge_bias
             if self.rpe is not None:
                 grid_coord = point.grid_coord[order].reshape(-1, patch_size, 3)
                 rel_pos = grid_coord.unsqueeze(2) - grid_coord.unsqueeze(1)
@@ -703,6 +856,8 @@ class SerializedAttention(PointModule):
         else:
             if cu_seqlens is None:
                 raise ValueError("Flash attention needs the cumulative sequence lengths")
+            if self.merge_stride is not None:
+                raise NotImplementedError("Token merging runs only on the non-flash path.")
             if self.flash_attn is None:
                 self.flash_attn = load_flash_attn_module()
             packed = (
@@ -791,6 +946,10 @@ class Block(PointModule):
         enable_conv: bool = True,
         enable_attn: bool = True,
         rope_base: float | None = None,
+        merge_stride: int | None = None,
+        merge_size_bias: bool = False,
+        kv_pool: int | None = None,
+        kv_pool_split_gemm: bool = False,
     ) -> None:
         """Initialize one PTv3 attention block.
 
@@ -820,6 +979,12 @@ class Block(PointModule):
                 stages.
             rope_base: Frequency base for axis-split 3D rotary embedding, or
                 ``None`` to disable it.
+            merge_stride: Static key/value token-merge stride of the attention, or
+                ``None`` to disable it. See :class:`SerializedAttention`.
+            merge_size_bias: Add ``log(size)`` of merged tokens to the attention logits.
+            kv_pool: Key/value pooling factor of the attention, or ``None``. See
+                :class:`SerializedAttention`.
+            kv_pool_split_gemm: Project keys/values from the pooled input.
 
         Raises:
             ValueError: Raised when the block would carry no operation at all.
@@ -860,6 +1025,10 @@ class Block(PointModule):
                 upcast_attention=upcast_attention,
                 upcast_softmax=upcast_softmax,
                 rope_base=rope_base,
+                merge_stride=merge_stride,
+                merge_size_bias=merge_size_bias,
+                kv_pool=kv_pool,
+                kv_pool_split_gemm=kv_pool_split_gemm,
             )
             self.norm2 = PointSequential(nn.LayerNorm(channels))
             self.mlp = PointSequential(MLP(channels, mlp_ratio, proj_drop))
@@ -1270,6 +1439,10 @@ class PointTransformerV3Encoder(PointModule):
         enc_conv: Sequence[bool] | bool = True,
         enc_attn: Sequence[bool] | bool = True,
         enc_rope_base: Sequence[float | None] | float | None = None,
+        enc_merge_stride: Sequence[int | None] | int | None = None,
+        enc_merge_size_bias: bool = False,
+        enc_kv_pool: Sequence[int | None] | int | None = None,
+        enc_kv_pool_split_gemm: bool = False,
     ) -> None:
         """Initialize the PTv3 encoder.
 
@@ -1303,6 +1476,18 @@ class PointTransformerV3Encoder(PointModule):
                 every stage.
             enc_rope_base: Rotary-embedding frequency base, either one value for
                 every stage or one per stage. ``None`` disables RoPE.
+            enc_merge_stride: Static key/value token-merge stride of the attention
+                blocks, one value for every stage or one per stage. ``None`` (default)
+                disables it. A latency experiment for the export path; see
+                :class:`SerializedAttention`.
+            enc_merge_size_bias: Add ``log(size)`` of merged tokens to the attention
+                logits in every stage that merges.
+            enc_kv_pool: Key/value pooling factor of the attention blocks (PVT-style
+                spatial reduction inside each patch), one value for every stage or one
+                per stage. ``None`` (default) disables it. A latency experiment for the
+                export path; see :class:`SerializedAttention`.
+            enc_kv_pool_split_gemm: Project keys/values from the pooled input in every
+                stage that pools.
         """
         super().__init__()
         self.in_channels = in_channels
@@ -1315,6 +1500,10 @@ class PointTransformerV3Encoder(PointModule):
         self.enc_conv = expand_stage_flags(enc_conv, stage_count, True, "enc_conv")
         self.enc_attn = expand_stage_flags(enc_attn, stage_count, True, "enc_attn")
         self.enc_rope_base = expand_stage_flags(enc_rope_base, stage_count, None, "enc_rope_base")
+        self.enc_merge_stride = expand_stage_flags(
+            enc_merge_stride, stage_count, None, "enc_merge_stride"
+        )
+        self.enc_kv_pool = expand_stage_flags(enc_kv_pool, stage_count, None, "enc_kv_pool")
         self.embedding = Embedding(
             in_channels, enc_channels[0], kernel_size=stem_kernel_size, stem_type=stem_type
         )
@@ -1355,6 +1544,15 @@ class PointTransformerV3Encoder(PointModule):
                         enable_conv=self.enc_conv[stage_index],
                         enable_attn=self.enc_attn[stage_index],
                         rope_base=self.enc_rope_base[stage_index],
+                        merge_stride=self.enc_merge_stride[stage_index],
+                        merge_size_bias=(
+                            enc_merge_size_bias
+                            and self.enc_merge_stride[stage_index] is not None
+                        ),
+                        kv_pool=self.enc_kv_pool[stage_index],
+                        kv_pool_split_gemm=(
+                            enc_kv_pool_split_gemm and self.enc_kv_pool[stage_index] is not None
+                        ),
                     ),
                     name=f"block{block_index}",
                 )
