@@ -139,6 +139,108 @@ def test_serialized_attention_uses_flash_module_when_enabled() -> None:
     assert attention.flash_attn is flash_module
 
 
+def _non_flash_attention(
+    channels: int, num_heads: int, head_dim: int | None = None
+) -> SerializedAttention:
+    """Return a non-flash attention module, optionally with an explicit head width."""
+    return SerializedAttention(
+        channels=channels,
+        num_heads=num_heads,
+        patch_size=4,
+        qkv_bias=True,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        order_index=0,
+        enable_rpe=False,
+        enable_flash=False,
+        upcast_attention=False,
+        upcast_softmax=False,
+        head_dim=head_dim,
+    ).eval()
+
+
+def test_serialized_attention_default_head_width_is_channels_over_heads() -> None:
+    """Without ``head_dim`` the inner width stays ``channels``, as in PTv3."""
+    attention = _non_flash_attention(channels=32, num_heads=4)
+    explicit = _non_flash_attention(channels=32, num_heads=4, head_dim=8)
+
+    assert attention.head_dim == 8
+    assert attention.inner_channels == 32
+    assert attention.scale == 8**-0.5
+    assert attention.qkv.weight.shape == (96, 32)
+    assert attention.proj.weight.shape == (32, 32)
+    assert {k: v.shape for k, v in attention.state_dict().items()} == {
+        k: v.shape for k, v in explicit.state_dict().items()
+    }
+    with pytest.raises(ValueError, match="divisible"):
+        _non_flash_attention(channels=32, num_heads=3)
+
+
+def test_serialized_attention_head_width_is_decoupled_from_channels() -> None:
+    """Fewer heads at the trained head width equal the trained attention without the others.
+
+    Heads are independent until ``proj``, so zeroing the ``proj`` columns of heads 2 and 3
+    removes them exactly; keeping heads 0 and 1 at width 8 must give the same output.
+    """
+    torch.manual_seed(0)
+    full = _non_flash_attention(channels=32, num_heads=4)
+    narrow = _non_flash_attention(channels=32, num_heads=2, head_dim=8)
+    assert narrow.inner_channels == 16
+    assert narrow.scale == full.scale
+    with torch.no_grad():
+        full.proj.weight[:, 16:] = 0.0
+    state = full.state_dict()
+    state["qkv.weight"] = state["qkv.weight"].reshape(3, 4, 8, 32)[:, :2].reshape(48, 32)
+    state["qkv.bias"] = state["qkv.bias"].reshape(3, 4, 8)[:, :2].reshape(48)
+    state["proj.weight"] = state["proj.weight"][:, :16]
+    narrow.load_state_dict(state)
+    # A non-divisible width is fine once the head width is explicit.
+    assert _non_flash_attention(channels=32, num_heads=3, head_dim=8).inner_channels == 24
+
+    feat = torch.randn(10, 32)
+
+    def run(attention: SerializedAttention) -> torch.Tensor:
+        point = _identity_point(10)
+        point.feat = feat.clone()
+        with torch.no_grad():
+            return attention(point).feat
+
+    assert torch.allclose(run(narrow), run(full), atol=1e-6)
+
+
+def test_encoder_passes_the_head_width_to_every_stage() -> None:
+    """``enc_head_dim`` reaches the attention of every block, one value per stage."""
+    encoder = PointTransformerV3Encoder(
+        in_channels=SweepSplitVoxelFeatureEncoder.out_channels,
+        order=("z",),
+        stride=(2,),
+        enc_depths=(1, 1),
+        enc_channels=(8, 16),
+        enc_num_head=(1, 1),
+        enc_patch_size=(4, 4),
+        mlp_ratio=2.0,
+        qkv_bias=True,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        drop_path=0.0,
+        pre_norm=True,
+        shuffle_orders=False,
+        enable_rpe=False,
+        enable_flash=False,
+        upcast_attention=False,
+        upcast_softmax=False,
+        enc_head_dim=(8, None),
+    )
+
+    assert encoder.enc.enc0.block0.attn.head_dim == 8
+    assert encoder.enc.enc1.block0.attn.head_dim == 16
+    assert encoder.enc.enc1.block0.attn.proj.weight.shape == (16, 16)
+    default = build_ptv3_encoder()
+    assert [default.enc.enc0.block0.attn.head_dim, default.enc.enc1.block0.attn.head_dim] == [8, 8]
+
+
 def test_prepare_for_export_disables_flash_attention_without_mutating_live_encoder() -> None:
     flash_module = SimpleNamespace(
         flash_attn_varlen_qkvpacked_func=lambda qkv,

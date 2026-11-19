@@ -536,6 +536,7 @@ class SerializedAttention(PointModule):
         upcast_attention: bool,
         upcast_softmax: bool,
         rope_base: float | None = None,
+        head_dim: int | None = None,
     ) -> None:
         """Initialize serialized attention.
 
@@ -555,10 +556,18 @@ class SerializedAttention(PointModule):
             rope_base: Frequency base for axis-split 3D rotary embedding over
                 voxel coordinates. ``None`` disables RoPE, which is the PTv3
                 default and leaves the attention path unchanged.
+            head_dim: Per-head channel count. ``None`` (the PTv3 default) uses
+                ``channels // num_heads``, so the attention inner width equals
+                ``channels``. An explicit value decouples the inner width
+                ``num_heads * head_dim`` from ``channels``, e.g. for a
+                head-pruned model that keeps the trained head dimension.
         """
         super().__init__()
-        if channels % num_heads != 0:
-            raise ValueError("channels must be divisible by num_heads")
+        if head_dim is None:
+            if channels % num_heads != 0:
+                raise ValueError("channels must be divisible by num_heads")
+            head_dim = channels // num_heads
+        inner_channels = num_heads * head_dim
         if enable_flash and enable_rpe:
             raise ValueError(
                 "Flash attention does not support relative positional encoding in PTv3."
@@ -570,23 +579,25 @@ class SerializedAttention(PointModule):
 
         self.channels = channels
         self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.inner_channels = inner_channels
         self.enable_flash = enable_flash
         self.patch_size_max = patch_size
         self.patch_size = patch_size if enable_flash else 0
-        self.scale = qk_scale or (channels // num_heads) ** -0.5
+        self.scale = qk_scale or head_dim**-0.5
         self.order_index = order_index
         self.upcast_attention = upcast_attention
         self.upcast_softmax = upcast_softmax
         self.enable_rpe = enable_rpe
         self.export_mode = False
-        self.qkv = nn.Linear(channels, channels * 3, bias=qkv_bias)
-        self.proj = nn.Linear(channels, channels)
+        self.qkv = nn.Linear(channels, inner_channels * 3, bias=qkv_bias)
+        self.proj = nn.Linear(inner_channels, channels)
         self.proj_drop = nn.Dropout(proj_drop)
         self.attn_drop_p = attn_drop
         self.attn_drop = nn.Dropout(attn_drop)
         self.softmax = nn.Softmax(dim=-1)
         self.rpe = RelativePositionEncoding(patch_size, num_heads) if enable_rpe else None
-        self.rope = Point3DRoPE(channels // num_heads, rope_base) if rope_base is not None else None
+        self.rope = Point3DRoPE(head_dim, rope_base) if rope_base is not None else None
         self.flash_attn = None
 
     @torch.no_grad()
@@ -655,7 +666,7 @@ class SerializedAttention(PointModule):
                 else int(offset_to_bincount(point.offset).min().item())
             )
         patch_size = self.patch_size
-        channel_count = self.channels
+        channel_count = self.inner_channels
         if self.export_mode:
             # `patch_order` is precomputed outside the graph (`build_patch_order`). With a
             # single export sample `unpad` is the identity, so the inverse is used as is.
@@ -667,7 +678,7 @@ class SerializedAttention(PointModule):
             order = point.serialized_order[self.order_index][pad]
             inverse = unpad[point.serialized_inverse[self.order_index]]
         qkv = self.qkv(point.feat[order])
-        head_dim = channel_count // head_count
+        head_dim = self.head_dim
 
         # With RoPE the projection has to be split before attention so queries
         # and keys can be rotated by their voxel positions; without it the
@@ -791,6 +802,7 @@ class Block(PointModule):
         enable_conv: bool = True,
         enable_attn: bool = True,
         rope_base: float | None = None,
+        head_dim: int | None = None,
     ) -> None:
         """Initialize one PTv3 attention block.
 
@@ -820,6 +832,8 @@ class Block(PointModule):
                 stages.
             rope_base: Frequency base for axis-split 3D rotary embedding, or
                 ``None`` to disable it.
+            head_dim: Per-head attention width, or ``None`` for
+                ``channels // num_heads``. See :class:`SerializedAttention`.
 
         Raises:
             ValueError: Raised when the block would carry no operation at all.
@@ -860,6 +874,7 @@ class Block(PointModule):
                 upcast_attention=upcast_attention,
                 upcast_softmax=upcast_softmax,
                 rope_base=rope_base,
+                head_dim=head_dim,
             )
             self.norm2 = PointSequential(nn.LayerNorm(channels))
             self.mlp = PointSequential(MLP(channels, mlp_ratio, proj_drop))
@@ -1270,6 +1285,7 @@ class PointTransformerV3Encoder(PointModule):
         enc_conv: Sequence[bool] | bool = True,
         enc_attn: Sequence[bool] | bool = True,
         enc_rope_base: Sequence[float | None] | float | None = None,
+        enc_head_dim: Sequence[int | None] | int | None = None,
     ) -> None:
         """Initialize the PTv3 encoder.
 
@@ -1303,6 +1319,12 @@ class PointTransformerV3Encoder(PointModule):
                 every stage.
             enc_rope_base: Rotary-embedding frequency base, either one value for
                 every stage or one per stage. ``None`` disables RoPE.
+            enc_head_dim: Per-head attention width, either one value for every
+                stage or one per stage. ``None`` (the default) keeps the PTv3
+                coupling ``enc_channels[i] // enc_num_head[i]``; setting it
+                (e.g. 16 with halved ``enc_num_head``) narrows the attention
+                inner width to ``enc_num_head[i] * enc_head_dim[i]`` while the
+                stage width stays ``enc_channels[i]``.
         """
         super().__init__()
         self.in_channels = in_channels
@@ -1315,6 +1337,7 @@ class PointTransformerV3Encoder(PointModule):
         self.enc_conv = expand_stage_flags(enc_conv, stage_count, True, "enc_conv")
         self.enc_attn = expand_stage_flags(enc_attn, stage_count, True, "enc_attn")
         self.enc_rope_base = expand_stage_flags(enc_rope_base, stage_count, None, "enc_rope_base")
+        self.enc_head_dim = expand_stage_flags(enc_head_dim, stage_count, None, "enc_head_dim")
         self.embedding = Embedding(
             in_channels, enc_channels[0], kernel_size=stem_kernel_size, stem_type=stem_type
         )
@@ -1355,6 +1378,7 @@ class PointTransformerV3Encoder(PointModule):
                         enable_conv=self.enc_conv[stage_index],
                         enable_attn=self.enc_attn[stage_index],
                         rope_base=self.enc_rope_base[stage_index],
+                        head_dim=self.enc_head_dim[stage_index],
                     ),
                     name=f"block{block_index}",
                 )
