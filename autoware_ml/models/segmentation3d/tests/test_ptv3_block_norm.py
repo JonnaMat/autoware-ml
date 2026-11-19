@@ -20,7 +20,9 @@ import copy
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel
 
 from autoware_ml.models.detection3d.tests.ptv3_detection3d_fixtures import (
     build_inputs,
@@ -317,6 +319,51 @@ def test_progressive_norm_step_survives_a_state_dict_round_trip() -> None:
     target(x)
     assert int(target.step) == 4
     assert float(target.ln_weight()) == pytest.approx(0.5)
+
+
+def test_progressive_norm_trains_under_ddp_across_the_switch(tmp_path) -> None:
+    """
+    Input: Linear -> ProgressiveLayerToBatchNorm (decay 3) -> Linear wrapped in CPU DDP (gloo,
+    world size 1, find_unused_parameters=False as in training), 2 SGD steps before the blend ends
+    and 3 after it.
+    Expected: the retired LayerNorm stays in the graph with a zero contribution, so DDP does not
+    raise "parameters that were not used in producing the loss" after the switch, and the
+    post-switch output equals the pure BatchNorm path.
+    Check: every parameter has a gradient at every step; the LN gradients are exactly zero and the
+    output equals bn(x) bit for bit after the switch.
+    """
+    torch.manual_seed(0)
+    model = nn.Sequential(
+        nn.Linear(8, 16), ProgressiveLayerToBatchNorm(16, decay_steps=3), nn.Linear(16, 4)
+    )
+    norm = model[1]
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'store'}", rank=0, world_size=1
+    )
+    try:
+        ddp = DistributedDataParallel(model, find_unused_parameters=False)
+        optimizer = torch.optim.SGD(ddp.parameters(), lr=0.1)
+        x = torch.randn(64, 8)
+        for step in range(1, 6):
+            optimizer.zero_grad(set_to_none=True)
+            ddp(x).square().mean().backward()
+            assert int(norm.step) == step
+            for name, parameter in model.named_parameters():
+                assert parameter.grad is not None, (step, name)
+            ln_grads = [norm.ln.weight.grad, norm.ln.bias.grad]
+            if step >= 3:
+                assert all(torch.count_nonzero(grad) == 0 for grad in ln_grads), step
+                with torch.no_grad():
+                    hidden = model[0](x)
+                    bn_train = copy.deepcopy(norm.bn)
+                    assert torch.equal(norm(hidden), bn_train(hidden))
+                norm.step -= 1
+                norm._host_step -= 1
+            else:
+                assert any(torch.count_nonzero(grad) > 0 for grad in ln_grads), step
+            optimizer.step()
+    finally:
+        dist.destroy_process_group()
 
 
 def test_progressive_blocks_fold_only_after_the_blend() -> None:

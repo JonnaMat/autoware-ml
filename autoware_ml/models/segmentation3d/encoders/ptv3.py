@@ -793,6 +793,8 @@ class ProgressiveLayerToBatchNorm(nn.Module):
     every DDP rank counts the same). The LayerNorm takes the pretrained LN's parameters, so the model
     starts exactly at the LayerNorm network; from ``decay_steps`` on the layer is the BatchNorm alone,
     which folds into the adjacent linear layers on export. Both branches run while ``lam > 0``.
+    After the blend the LayerNorm parameters stay in the training graph with a zero contribution,
+    so DDP without ``find_unused_parameters`` keeps a gradient for every parameter.
     """
 
     def __init__(self, channels: int, decay_steps: int) -> None:
@@ -841,6 +843,11 @@ class ProgressiveLayerToBatchNorm(nn.Module):
             self.step += 1
             self._host_step += 1
         if self._host_step >= self.decay_steps:
+            if self.training:
+                # keep the retired LayerNorm parameters in the autograd graph with an exact zero
+                # contribution (x + 0 = x): DDP (find_unused_parameters=False) fails at the first
+                # backward in which a parameter received no gradient
+                return self.bn(input) + 0.0 * (self.ln.weight.sum() + self.ln.bias.sum())
             return self.bn(input)
         lam = self.ln_weight()
         return lam * self.ln(input) + (1.0 - lam) * self.bn(input)
