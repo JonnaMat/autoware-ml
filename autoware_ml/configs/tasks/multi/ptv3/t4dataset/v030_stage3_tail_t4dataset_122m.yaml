@@ -1,0 +1,72 @@
+# @package _global_
+# Tail finetune on PTv3 v0.3.0's OWN stage-3 data mix, RDDR-1486 (EXP-147).
+# Data = voxel012_b8_24e_t4dataset_122m_v030 unchanged (amadeusz_szymko exp5, MLflow 48c532db,
+# perception-devops 2a50377): main = pseudo_10hz_500k j6gen2 (271,446 train frames) x1, jpntaxi =
+# pseudo_10hz_500k jpntaxi (147,723) x1, joint = Kognic db_j6gen2_det3d_seg3d_v1 rev 2 with
+# require_semantic_mask (7,250) x4, mannequin = pseudo_mannequin_v2 (7,381) x1: 455,550 samples per
+# full epoch, drawn by the weighted frame sampler (seed + epoch). Same LR groups as v0.3.0 stage 3
+# (default 1.5e-4, encoder blocks 1e-5, encoder rest 2.5e-5, seg3d head 5e-5, peak 2x), AdamW wd
+# 0.01, clip 5.0, drop_path 0.3, precision 32-true (v0.3.0's; this tree has no bf16 fixes).
+# Tail = tail_epochs pseudo-epochs of tail_steps_per_epoch optimizer steps each
+# (trainer.limit_train_batches): every pseudo-epoch is a fresh weighted draw of the full mix,
+# validated on the Kognic val split only (the joint source's 40 scenes = the kognic leaf's val), so
+# best.ckpt is chosen as in EXP-144. The per-step warmup + cosine schedule of EXP-144 is set by the
+# launcher (tools/gw_stage3_ft_job.sh WARMUP_STEPS); without it the scheduler is the per-epoch
+# cosine from 2x over tail_epochs.
+#   autoware-ml train --config-name multi/ptv3/t4dataset/v030_stage3_tail_t4dataset_122m \
+#     --weights <v0.3.0 best.ckpt or a pruned copy> tail_epochs=<E> tail_steps_per_epoch=<L> [arch]
+defaults:
+  - voxel012_b8_24e_t4dataset_122m_v030
+  - _self_
+
+tail_epochs: 12
+tail_steps_per_epoch: 452
+
+experiment_group_name: ptv3_det3d_seg3d/${database.version}/v030_s3_tail
+experiment_name: v030_stage3_tail_t4dataset_122m
+
+datamodule:
+  sources:
+    main:
+      # validation on the Kognic val split only (the main source's 27,593 val frames would cost
+      # ~15 min per validation); test is never run with this leaf
+      validation_dataset: null
+
+model:
+  scheduler:
+    warmup_epochs: 0
+    decay_epochs: ${tail_epochs}
+    max_lr_factor: 2.0
+
+trainer:
+  precision: 32-true
+  max_epochs: ${tail_epochs}
+  limit_train_batches: ${tail_steps_per_epoch}
+  check_val_every_n_epoch: 1
+
+callbacks:
+  dynamic_validation:
+    epoch_intervals: [[0, 1]]
+  early_stopping: null
+  model_checkpoint_last:
+    save_on_train_epoch_end: true
+
+metric_params:
+  detection3d:
+    components:
+      detection3d_components:
+        - { _target_: autoware_ml.metrics.detection3d.frame_count.FrameCount, stages: [val, test] }
+        - { _target_: autoware_ml.metrics.detection3d.box_counts.BoxCounts, stages: [val, test] }
+        - { _target_: autoware_ml.metrics.detection3d.mean_ap.MeanAP, stages: [val, test] }
+      occlusion_split_components:
+        - { _target_: autoware_ml.metrics.detection3d.mean_ap.MeanAP, stages: [test] }
+  segmentation3d:
+    components:
+      confusion_components:
+        - { _target_: autoware_ml.metrics.segmentation3d.frame_count.FrameCount, stages: [val, test] }
+        - { _target_: autoware_ml.metrics.segmentation3d.iou.IoU, stages: [val, test] }
+        - { _target_: autoware_ml.metrics.segmentation3d.accuracy.Accuracy, stages: [val, test] }
+      point_components:
+        - { _target_: autoware_ml.metrics.segmentation3d.frame_count.FrameCount, stages: [test] }
+
+det3d_seg3d_metrics: []

@@ -1,0 +1,13 @@
+# Mannequin recordings with the current vehicle lidar filtering.
+defaults:
+  - t4dataset/t4dataset_common@_here_
+  - t4dataset/scenarios@scenarios.db_pseudo_mannequin_v2:
+      detection3d_segmentation3d_pseudo_10hz/db_pseudo_mannequin_v2
+  - override t4dataset/taxonomy/vocabulary@vocabulary: full_detection3d
+  - override t4dataset/box3d_pipelines@box3d_pipelines:
+      trailer_merge_box3d_pipelines
+  - _self_
+
+version: T4Dataset-pseudo_mannequin_v2-v1.0.0
+cache_path: ${cache_root_path}/t4dataset_pseudo_mannequin_v2/
+root_path: ${data_root_path}/t4dataset/pseudo_mannequin_v2/

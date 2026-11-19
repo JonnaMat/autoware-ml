@@ -1,0 +1,21 @@
+# @package _global_
+# Stage 3 with official Kognic annotations and the current mannequin recordings.
+defaults:
+  - voxel012_b8_24e_t4dataset_122m_pseudo_10hz_500k
+  - override /database@joint_database: t4dataset/t4dataset_j6gen2_det3d_seg3d_v1
+  - override /database@mannequin_database:
+      t4dataset/t4dataset_pseudo_mannequin_v2
+  - _self_
+
+experiment_name: voxel012_b8_24e_t4dataset_122m_v030
+
+datamodule:
+  sources:
+    main:
+      repeat: 1
+    jpntaxi:
+      repeat: 1
+    joint:
+      repeat: 4
+    mannequin:
+      repeat: 1

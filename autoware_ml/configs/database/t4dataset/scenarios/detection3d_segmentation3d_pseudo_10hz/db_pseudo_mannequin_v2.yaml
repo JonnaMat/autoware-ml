@@ -1,0 +1,10 @@
+_target_: autoware_ml.databases.t4dataset.t4scenarios.T4Scenarios
+_convert_: all
+
+scenario_root_path: ${scenarios_path:t4dataset/detection3d_segmentation3d_pseudo_10hz}
+
+dataset_params:
+  - _target_: autoware_ml.databases.scenarios.DatasetParams
+    _convert_: all
+    dataset_name: pseudo_mannequin_v2
+    sample_steps: 1
