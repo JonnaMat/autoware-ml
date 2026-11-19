@@ -46,6 +46,7 @@ from autoware_ml.models.detection3d.tests.ptv3_detection3d_fixtures import (
 )
 from autoware_ml.models.segmentation3d.encoders.ptv3 import (
     Block,
+    Cpe,
     Point,
     PointSequential,
     PointTransformerV3Encoder,
@@ -75,6 +76,7 @@ from autoware_ml.models.segmentation3d.ptv3_base import (
     validate_serialization_geometry,
 )
 from autoware_ml.ops.spconv.availability import IS_SPCONV_AVAILABLE
+from autoware_ml.ops.submanifold_conv import SubMConv3d
 
 
 def test_serialized_attention_requires_supported_flash_configuration() -> None:
@@ -1405,7 +1407,7 @@ def test_export_folds_the_cpe_bias_into_the_linear_layer(monkeypatch) -> None:
     state = {key: value.clone() for key, value in model.state_dict().items()}
 
     folded = model.build_export_specs(batch)
-    monkeypatch.setattr(Block, "fold_cpe_bias", lambda block: None)
+    monkeypatch.setattr(Cpe, "fold_bias", lambda encoding: None)
     reference = model.build_export_specs(batch)
 
     for name in ("ptv3_encoder", "ptv3_seg3d_head"):
@@ -1424,3 +1426,27 @@ def test_export_folds_the_cpe_bias_into_the_linear_layer(monkeypatch) -> None:
         assert all(next(block.cpe.children()).bias is None for block in blocks), name
     for key, value in model.state_dict().items():
         assert torch.equal(value, state[key]), key
+
+
+@pytest.mark.skipif(not IS_SPCONV_AVAILABLE, reason="PTv3 positional encoding requires spconv")
+def test_positional_encoding_loads_the_sequential_checkpoint_layout() -> None:
+    """
+    Input: the state dict of a PointSequential of a submanifold convolution, a linear layer
+    and a layer norm, the layout PTv3 checkpoints store under ``cpe``.
+    Expected: Cpe loads it strictly and holds the same tensors.
+    Check: no missing or unexpected keys, and every tensor matches.
+    """
+    torch.manual_seed(0)
+    sequential = PointSequential(
+        SubMConv3d(8, 8, kernel_size=3, bias=True, indice_key="stage0"),
+        nn.Linear(8, 8),
+        nn.LayerNorm(8),
+    )
+    _jitter_affine_parameters(sequential)
+    encoding = Cpe(8, "stage0")
+
+    result = encoding.load_state_dict(sequential.state_dict(), strict=True)
+
+    assert not result.missing_keys and not result.unexpected_keys
+    for key, value in sequential.state_dict().items():
+        assert torch.equal(encoding.state_dict()[key], value), key
