@@ -1,0 +1,8 @@
+# @package _global_
+# Whole-image traffic light detector with a ResNet-18 backbone and a fourth level at stride 4.
+defaults:
+  - base_960x960_tlr
+  - ../backbone_resnet18_p2
+  - _self_
+
+experiment_name: resnet18_p2_960x960_tlr

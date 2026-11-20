@@ -33,6 +33,8 @@ the CLI as the path relative to `tasks/`.
 | `detection2d/yolox/t4dataset/hgnetv2_b0_native_960x960_tlr` | HGNetV2-B0 | HGNetV2-B0 with a neck of the widths of its backbone |
 | `detection2d/yolox/t4dataset/cspnext_s_960x960_tlr`         | CSPNeXt-S  | The same detector with a CSPNeXt-S backbone          |
 | `detection2d/yolox/t4dataset/cspnext_s_coco_960x960_tlr`    | CSPNeXt-S  | CSPNeXt-S with the input convention of COCO weights  |
+| `detection2d/yolox/t4dataset/yolox_s_p2_960x960_tlr`        | CSPDarknet | YOLOX-S with a fourth level at stride 4              |
+| `detection2d/yolox/t4dataset/resnet18_p2_960x960_tlr`       | ResNet-18  | ResNet-18 with a fourth level at stride 4            |
 
 All detect two classes, `traffic_light` and `pedestrian_traffic_light`, at 960x960. They read
 the scenario lists `db_tlr_v1.yaml` to `db_tlr_v7.yaml` below `t4dataset/detection2d/` of
@@ -50,6 +52,7 @@ The config tree separates what two detectors share from what tells them apart:
 | `backbone_resnet18.yaml`          | ResNet-18 of torchvision and its input normalization                |
 | `backbone_hgnetv2_*.yaml`         | HGNetV2 of timm, its input normalization and its projections        |
 | `backbone_cspnext_s*.yaml`        | CSPNeXt-S of RTMDet and the input convention of its weights         |
+| `backbone_*_p2.yaml`              | The same backbones with a fourth level at stride 4                  |
 | `t4dataset/base_960x960.yaml`     | Input size, training and test pipelines, metric suites              |
 | `t4dataset/base_960x960_tlr.yaml` | Traffic light database, taxonomy and validation schedule            |
 
@@ -68,6 +71,15 @@ cache by name. `cspnext_s_960x960_tlr` with `model.backbone.weights=cspnext_s_im
 starts from the ImageNet classifier, which reads RGB. `cspnext_s_coco_960x960_tlr` with
 `model.backbone.weights=rtmdet_s_coco_300e` starts from the backbone of the RTMDet-S detector
 trained on COCO, which reads BGR; its neck and head are not used.
+
+The `backbone_*_p2` blocks add a level at stride 4 for small objects: the backbone returns its
+stride 4 feature map too (`out_indices: [0, 1, 2, 3]`), the neck fuses four levels (`in_channels:
+[64, 128, 256, 512]`) and the head predicts at `strides: [4, 8, 16, 32]`. The three coarser levels
+keep their modules, so a three-level checkpoint initializes them; the levels of the head are counted
+from the finest, so `convert_weights --head-level-offset 1` writes the weights of a three-level head
+one level up, where the four-level head reads them. A 960x960 input then has 76 500 priors (240² +
+120² + 60² + 30²) instead of 18 900, and the deployed graph outputs one row for each, the stride 4
+rows first: a runtime decoding the output needs the four strides.
 
 ## Training
 

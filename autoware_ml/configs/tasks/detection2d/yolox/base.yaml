@@ -92,7 +92,8 @@ model:
   export_input_channel_order: bgr
 
   # The backbone returns the feature maps at strides 8, 16 and 32. A leaf composes one of the
-  # backbone_* blocks, which also tells the neck the channels of those feature maps.
+  # backbone_* blocks, which also tells the neck the channels of those feature maps. The
+  # backbone_*_p2 blocks add the feature map at stride 4 as a fourth level of the neck and head.
   backbone: ???
   neck:
     _target_: autoware_ml.models.common.necks.yolox_pafpn.YOLOXPAFPN
