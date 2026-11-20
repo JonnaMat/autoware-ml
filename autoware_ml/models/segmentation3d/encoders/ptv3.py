@@ -1525,6 +1525,7 @@ class LitePTEncoder(PointTransformerV3Encoder):
         enc_conv: Sequence[bool] = (True, True, True, False, False),
         enc_attn: Sequence[bool] = (False, False, False, True, True),
         enc_rope_base: Sequence[float | None] | float | None = 100.0,
+        enc_head_dim: Sequence[int | None] | int | None = None,
         qk_norm: bool = False,
     ) -> None:
         """Initialize the LitePT encoder.
@@ -1558,6 +1559,9 @@ class LitePTEncoder(PointTransformerV3Encoder):
             enc_conv: Per-stage convolution flags.
             enc_attn: Per-stage attention flags.
             enc_rope_base: Rotary-embedding frequency base per stage.
+            enc_head_dim: Per-head attention width per stage, or one value for
+                every stage; ``None`` keeps ``channels // num_heads``. See
+                :class:`PointTransformerV3Encoder`.
             qk_norm: Whether the attention stages layer-normalize queries and
                 keys per head. Off in the published parametrization; the T4
                 recipes turn it on because the conv-less blocks otherwise grow
@@ -1588,6 +1592,7 @@ class LitePTEncoder(PointTransformerV3Encoder):
             enc_conv=enc_conv,
             enc_attn=enc_attn,
             enc_rope_base=enc_rope_base,
+            enc_head_dim=enc_head_dim,
             qk_norm=qk_norm,
         )
 
