@@ -24,12 +24,15 @@ exports it with the output layout the Autoware `tensorrt_yolox` runtime decodes.
 Experiment configs live under `autoware_ml/configs/tasks/detection2d/yolox/` and are passed to
 the CLI as the path relative to `tasks/`.
 
-| Config Name                                        | Backbone   | Purpose                                     |
-| -------------------------------------------------- | ---------- | ------------------------------------------- |
-| `detection2d/yolox/t4dataset/yolox_s_960x960_tlr`  | CSPDarknet | Whole-image traffic light detector, YOLOX-S |
-| `detection2d/yolox/t4dataset/resnet18_960x960_tlr` | ResNet-18  | The same detector with a ResNet-18 backbone |
+| Config Name                                                   | Backbone     | Purpose                                                                           |
+| ------------------------------------------------------------- | ------------ | --------------------------------------------------------------------------------- |
+| `detection2d/yolox/t4dataset/yolox_s_960x960_tlr`             | CSPDarknet   | Whole-image traffic light detector, YOLOX-S                                       |
+| `detection2d/yolox/t4dataset/resnet18_960x960_tlr`            | ResNet-18    | The same detector with a ResNet-18 backbone                                       |
+| `detection2d/yolox/t4dataset/vit_s_dinov2_global_960x960_tlr` | DINOv2 ViT-S | The same detector with a plain vision transformer, every block attending globally |
+| `detection2d/yolox/t4dataset/vit_s_dinov2_window_960x960_tlr` | DINOv2 ViT-S | The same, attending within windows except in four blocks                          |
+| `detection2d/yolox/t4dataset/pvt_v2_b1_960x960_tlr`           | PVT v2 B1    | The same detector with a hierarchical transformer                                 |
 
-Both detect two classes, `traffic_light` and `pedestrian_traffic_light`, at 960x960. They read
+All detect two classes, `traffic_light` and `pedestrian_traffic_light`, at 960x960. They read
 the scenario lists `db_tlr_v1.yaml` to `db_tlr_v7.yaml` below `t4dataset/detection2d/` of
 `AUTOWARE_ML_SCENARIOS_PATH` and the scenes below `t4dataset/` of `AUTOWARE_ML_DATA_PATH`, see
 [Configuration](../user-guide/configuration.md#external-configs-and-scenario-lists). The lists
@@ -43,6 +46,9 @@ The config tree separates what two detectors share from what tells them apart:
 | `base.yaml`                       | Detector, neck, head, optimizer, schedule, averaged weights, export |
 | `backbone_csp_darknet_s.yaml`     | CSPDarknet of YOLOX-S and its input convention                      |
 | `backbone_resnet18.yaml`          | ResNet-18 of torchvision and its input normalization                |
+| `backbone_vit_s_dinov2.yaml`      | DINOv2 ViT-S of timm with a simple feature pyramid                  |
+| `backbone_pvt_v2_b1.yaml`         | PVT v2 B1 of timm and its input normalization                       |
+| `backbone_optimizer_adamw.yaml`   | AdamW and the learning rates of a pretrained transformer backbone   |
 | `t4dataset/base_960x960.yaml`     | Input size, training and test pipelines, metric suites              |
 | `t4dataset/base_960x960_tlr.yaml` | Traffic light database, taxonomy and validation schedule            |
 
@@ -105,6 +111,41 @@ autoware-ml train \
     trainer.max_epochs=60 no_aug_epochs=10 warmup_epochs=3 \
     "callbacks.dynamic_validation.epoch_intervals=[[0,5],[50,1]]"
 ```
+
+### Transformer backbones
+
+The transformer leaves take their backbone from
+[timm](https://github.com/huggingface/pytorch-image-models). The neck, the head, the data and
+the schedule are those of the other leaves. A training starts from the pretrained weights of
+timm, downloaded on the first run, when asked to:
+
+```bash
+autoware-ml train --config-name detection2d/yolox/t4dataset/vit_s_dinov2_window_960x960_tlr \
+    model.backbone.pretrained=true
+```
+
+- `backbone_vit_s_dinov2.yaml` builds the ViT-S of DINOv2. Its weights are those of patch size
+  14: the kernel of the patch embedding is resampled to 16 and the position embedding to the
+  60x60 patch grid of a 960x960 input when they load, so the network keeps the input size of
+  the other backbones. A simple feature pyramid as in ViTDet turns the stride-16 token map
+  into the maps at strides 8, 16 and 32 the neck reads: a transposed convolution, the map
+  itself and a max pooling, each followed by a 1x1 and a 3x3 convolution.
+- `model.backbone.window_size` is the side of the attention windows in tokens, `null` for
+  global attention in every block. With windows, the blocks of
+  `model.backbone.global_block_indices` still attend over the whole image. The window leaf
+  uses 16 windows of 15x15 tokens and the global blocks 2, 5, 8 and 11.
+- `backbone_optimizer_adamw.yaml` replaces SGD by AdamW (weight decay 0.05,
+  `base_lr_per_image` 3.125e-6) and trains the pretrained backbone at
+  `model.backbone_lr_factor` times the learning rate, block `i` of the vision transformer at
+  a further `model.layer_decay ** (number of blocks + 1 - i)`. The values are starting
+  points and were not tuned.
+
+The neck and the head of these leaves have the shapes of YOLOX-S where the backbone widths
+allow it, so the converted COCO checkpoint initializes them when passed as `--weights` with
+`--skip-mismatched-weights`: the backbone keeps its own pretrained weights.
+
+In the exported graph the attention is a matrix product and a softmax with a constant scale,
+and every layer normalization is one `LayerNormalization` node (opset 17).
 
 ## Evaluation
 
@@ -189,24 +230,27 @@ the image resized to fit the network input:
 
 ## Implementation
 
-| Path                                                    | Description                                        |
-| ------------------------------------------------------- | -------------------------------------------------- |
-| `autoware_ml/models/detection2d/yolox.py`               | Detector and export wrapper                        |
-| `autoware_ml/models/detection2d/heads/yolox.py`         | Head, losses and decoding                          |
-| `autoware_ml/models/detection2d/task_modules/simota.py` | SimOTA label assignment                            |
-| `autoware_ml/models/common/backbones/csp_darknet.py`    | CSPDarknet backbone                                |
-| `autoware_ml/models/common/necks/yolox_pafpn.py`        | PAFPN neck                                         |
-| `autoware_ml/models/common/ema.py`                      | Exponential moving average of the weights          |
-| `autoware_ml/models/detection2d/yolox_weights.py`       | Conversion of reference checkpoints and ONNX files |
-| `autoware_ml/models/detection2d/yolox_onnx.py`          | ONNX backed detector for scoring exported graphs   |
-| `autoware_ml/databases/t4dataset/t4dataset_2d.py`       | T4 database of camera images with 2D boxes         |
-| `autoware_ml/datamodule/t4dataset/detection2d.py`       | Single camera 2D detection dataset                 |
-| `autoware_ml/transforms/detection2d/`                   | Loading, augmentation and letterbox transforms     |
-| `autoware_ml/metrics/detection2d/`                      | COCO style evaluation and metric suite             |
-| `autoware_ml/callbacks/strong_augmentation_schedule.py` | Schedule ending the strong augmentation            |
-| `autoware_ml/utils/schedulers/yolox_warm_cosine.py`     | Warmup, cosine and constant tail learning rate     |
-| `autoware_ml/scripts/tools/yolox/`                      | Weight conversion and ONNX evaluation tools        |
-| `autoware_ml/configs/tasks/detection2d/yolox/`          | Experiment configurations                          |
+| Path                                                    | Description                                                                   |
+| ------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `autoware_ml/models/detection2d/yolox.py`               | Detector and export wrapper                                                   |
+| `autoware_ml/models/detection2d/heads/yolox.py`         | Head, losses and decoding                                                     |
+| `autoware_ml/models/detection2d/task_modules/simota.py` | SimOTA label assignment                                                       |
+| `autoware_ml/models/common/backbones/csp_darknet.py`    | CSPDarknet backbone                                                           |
+| `autoware_ml/models/common/backbones/vit.py`            | Plain vision transformer with windowed attention and a simple feature pyramid |
+| `autoware_ml/models/common/backbones/pvt_v2.py`         | PVT v2 backbone                                                               |
+| `autoware_ml/models/detection2d/yolox_layer_decay.py`   | Detector with a learning rate per backbone layer                              |
+| `autoware_ml/models/common/necks/yolox_pafpn.py`        | PAFPN neck                                                                    |
+| `autoware_ml/models/common/ema.py`                      | Exponential moving average of the weights                                     |
+| `autoware_ml/models/detection2d/yolox_weights.py`       | Conversion of reference checkpoints and ONNX files                            |
+| `autoware_ml/models/detection2d/yolox_onnx.py`          | ONNX backed detector for scoring exported graphs                              |
+| `autoware_ml/databases/t4dataset/t4dataset_2d.py`       | T4 database of camera images with 2D boxes                                    |
+| `autoware_ml/datamodule/t4dataset/detection2d.py`       | Single camera 2D detection dataset                                            |
+| `autoware_ml/transforms/detection2d/`                   | Loading, augmentation and letterbox transforms                                |
+| `autoware_ml/metrics/detection2d/`                      | COCO style evaluation and metric suite                                        |
+| `autoware_ml/callbacks/strong_augmentation_schedule.py` | Schedule ending the strong augmentation                                       |
+| `autoware_ml/utils/schedulers/yolox_warm_cosine.py`     | Warmup, cosine and constant tail learning rate                                |
+| `autoware_ml/scripts/tools/yolox/`                      | Weight conversion and ONNX evaluation tools                                   |
+| `autoware_ml/configs/tasks/detection2d/yolox/`          | Experiment configurations                                                     |
 
 ## Acknowledgment
 
@@ -217,3 +261,14 @@ schedule are ported from the YOLOX reference implementation.
 - Repository: <https://github.com/Megvii-BaseDetection/YOLOX>
 - License: Apache 2.0
 - Paper: Ge, Z., Liu, S., Wang, F., Li, Z., and Sun, J. "YOLOX: Exceeding YOLO Series in 2021." arXiv:2107.08430, 2021.
+
+The transformer backbones and their pretrained weights come from timm. The windowed attention
+and the simple feature pyramid follow ViTDet.
+
+<!-- cspell:ignore timm Oquab Darcet Moutakanni Wenhai Enze Yanghao Hanzi Girshick Kaiming -->
+- Repository: <https://github.com/huggingface/pytorch-image-models>
+- License: Apache 2.0, also of the weights `vit_small_patch14_dinov2.lvd142m` and
+  `pvt_v2_b1.in1k`
+- Paper: Oquab, M., Darcet, T., Moutakanni, T., et al. "DINOv2: Learning Robust Visual Features without Supervision." arXiv:2304.07193, 2023.
+- Paper: Li, Y., Mao, H., Girshick, R., and He, K. "Exploring Plain Vision Transformer Backbones for Object Detection." arXiv:2203.16527, 2022.
+- Paper: Wang, W., Xie, E., Li, X., et al. "PVT v2: Improved Baselines with Pyramid Vision Transformer." arXiv:2106.13797, 2021.
