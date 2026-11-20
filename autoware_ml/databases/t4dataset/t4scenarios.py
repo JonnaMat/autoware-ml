@@ -97,7 +97,8 @@ class T4Scenarios(Scenarios):
         """
         Build scenario data from a scenario ID, either ``<scene>/<version>`` or
         ``<scene>/<version>/<location>/<vehicle_type>/<cone_barrier_status>`` where the last
-        segment is ``true``, ``false`` or ``none`` (annotation status unknown).
+        segment is ``true``, ``false`` or ``none`` (annotation status unknown). The short form
+        may separate the scene and its version by whitespace instead of the slash.
 
         Args:
           scenario_id: Scenario ID.
@@ -107,7 +108,8 @@ class T4Scenarios(Scenarios):
           ScenarioData: Scenario data.
         """
 
-        dataset_scene_info = scenario_id.split("/")
+        # A list may also separate the scene and its version by whitespace, ``<scene>   <version>``.
+        dataset_scene_info = scenario_id.split("/") if "/" in scenario_id else scenario_id.split()
         if len(dataset_scene_info) == 5:
             scenario_id, version, city, vehicle_type, status_text = dataset_scene_info
             traffic_cone_barrier_bbox_status = _parse_traffic_cone_barrier_bbox_status(status_text)

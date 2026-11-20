@@ -24,6 +24,7 @@ import polars as pl
 from pydantic import BaseModel, ConfigDict
 
 from autoware_ml.databases.schemas.base_schemas import DatasetTableColumn, DataModelInterface
+from autoware_ml.databases.schemas.box2d_schemas import Box2DDataModel, Box2DDatasetSchema
 from autoware_ml.databases.schemas.box3d_schemas import Box3DDataModel, Box3DDatasetSchema
 from autoware_ml.databases.schemas.lidar_frames import LidarFrameDatasetSchema, LidarFrameDataModel
 from autoware_ml.databases.schemas.image_frames import ImageFrameDatasetSchema, ImageFrameDataModel
@@ -69,6 +70,10 @@ class DatasetTableSchema:
       # Motion Schema
       MOTION: Motion column, which is a dictionary naming the source of the agent tracks
         and the vector map of a motion forecasting scenario and the shape of its time window.
+
+      # Boxes2D annotation Schema
+      BOXES_2D: 2D boxes column, a list of dictionaries with the boxes annotated in the image
+        frames of the record.
     """
 
     # Basic Schema
@@ -112,6 +117,11 @@ class DatasetTableSchema:
 
     # Motion Schema
     MOTION = DatasetTableColumn("motion", pl.Struct(MotionDatasetSchema.to_polars_field_schema()))
+
+    # Boxes2D annotation Schema
+    BOXES_2D = DatasetTableColumn(
+        "boxes_2d", pl.List(pl.Struct(Box2DDatasetSchema.to_polars_field_schema()))
+    )
 
     @classmethod
     def to_polars_schema(cls) -> pl.Schema:
@@ -161,6 +171,10 @@ class DatasetRecord(BaseModel, DataModelInterface):
       # Motion data
       motion: Motion data model of a motion forecasting scenario, None for a record of
         a perception database.
+
+      # Boxes2D annotation data
+      boxes_2d: 2D boxes annotated in the image frames of the record, None for a record of a
+        database without 2D box annotations.
     """
 
     # Set model config to frozen
@@ -182,6 +196,7 @@ class DatasetRecord(BaseModel, DataModelInterface):
     category_mapping: CategoryMappingDataModel | None
     boxes_3d: Sequence[Box3DDataModel] | None
     motion: MotionDataModel | None = None
+    boxes_2d: Sequence[Box2DDataModel] | None = None
 
     def to_dictionary(self) -> Mapping[str, Any]:
         """
@@ -229,6 +244,11 @@ class DatasetRecord(BaseModel, DataModelInterface):
         )
         data_model[DatasetTableSchema.MOTION.name] = (
             self.motion.to_dictionary() if self.motion is not None else None
+        )
+        data_model[DatasetTableSchema.BOXES_2D.name] = (
+            [box2d.to_dictionary() for box2d in self.boxes_2d]
+            if self.boxes_2d is not None
+            else None
         )
 
         return data_model
@@ -294,6 +314,10 @@ class DatasetRecord(BaseModel, DataModelInterface):
         else:
             motion = None
 
+        boxes_2d = data_model[DatasetTableSchema.BOXES_2D.name]
+        if boxes_2d is not None:
+            boxes_2d = [Box2DDataModel.load_from_dictionary(box) for box in boxes_2d]
+
         return cls(
             scenario_id=data_model[DatasetTableSchema.SCENARIO_ID.name],
             sample_id=data_model[DatasetTableSchema.SAMPLE_ID.name],
@@ -311,4 +335,5 @@ class DatasetRecord(BaseModel, DataModelInterface):
             category_mapping=category_mapping,
             boxes_3d=boxes_3d,
             motion=motion,
+            boxes_2d=boxes_2d,
         )
