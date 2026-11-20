@@ -1,0 +1,8 @@
+# @package _global_
+# Whole-image traffic light detector with a CSPNeXt-S backbone under the YOLOX neck and head.
+defaults:
+  - base_960x960_tlr
+  - ../backbone_cspnext_s
+  - _self_
+
+experiment_name: cspnext_s_960x960_tlr
