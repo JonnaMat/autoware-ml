@@ -21,7 +21,7 @@ normalizations are folded into the convolutions.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +35,7 @@ from autoware_ml.models.common.layers.csp import BN_EPS
 NETWORK_PREFIX = "network."
 EMA_PREFIX = "ema.module."
 EMA_NUM_UPDATES_KEY = "ema.num_updates"
+NETWORK_PARTS = ("backbone", "neck", "head")
 
 
 def rename_reference_key(key: str) -> str:
@@ -81,6 +82,37 @@ def to_detector_state_dict(
         )
         state_dict[EMA_NUM_UPDATES_KEY] = torch.zeros((), dtype=torch.long)
     return state_dict
+
+
+def select_parts(state_dict: Mapping[str, Tensor], parts: Sequence[str]) -> dict[str, Tensor]:
+    """Keep the tensors of some parts of the network in a state dict of the detector.
+
+    Weights reduced to the backbone initialize a detector whose neck and head start from
+    their own initialization; weights reduced to the neck and the head initialize those under
+    another backbone, whatever the names of its tensors.
+
+    Args:
+        state_dict: State dict of the detector.
+        parts: Parts to keep, out of ``backbone``, ``neck`` and ``head``.
+
+    Returns:
+        The tensors of the parts, of the weights and of the averaged copy, and the update
+        count of the average when the state dict holds one.
+
+    Raises:
+        ValueError: If no part or an unknown part is named.
+    """
+    unknown = sorted(set(parts) - set(NETWORK_PARTS))
+    if unknown or not parts:
+        raise ValueError(f"The parts must be some of {list(NETWORK_PARTS)}, got {list(parts)}.")
+    prefixes = tuple(
+        prefix + part + "." for prefix in (NETWORK_PREFIX, EMA_PREFIX) for part in parts
+    )
+    return {
+        key: value
+        for key, value in state_dict.items()
+        if key.startswith(prefixes) or key == EMA_NUM_UPDATES_KEY
+    }
 
 
 def convert_reference_checkpoint(

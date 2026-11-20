@@ -23,37 +23,57 @@ A ``.onnx`` source is an export of the YOLOX reference implementation with folde
 normalizations, any other file a checkpoint of it. Weights trained for another number of
 classes load with ``skip_mismatched_weights=true``, which leaves the class outputs at their
 initialization.
+
+``--parts`` keeps a part of the detector only, to start the rest from its own initialization::
+
+    python -m autoware_ml.scripts.tools.yolox.convert_weights yolox_s.pth backbone.ckpt \
+        --parts backbone
+    python -m autoware_ml.scripts.tools.yolox.convert_weights yolox_s.pth neck_head.ckpt \
+        --parts neck head
+
+The first initializes only the backbone of a YOLOX detector, the second the neck and the head
+below any backbone of the same output channels, which keeps its own weights.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 import logging
 from pathlib import Path
 
 import torch
 
 from autoware_ml.models.detection2d.yolox_weights import (
+    NETWORK_PARTS,
     convert_folded_onnx,
     convert_reference_checkpoint,
+    select_parts,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def convert(source: Path, destination: Path, with_ema: bool = True) -> None:
+def convert(
+    source: Path,
+    destination: Path,
+    with_ema: bool = True,
+    parts: Sequence[str] = NETWORK_PARTS,
+) -> None:
     """Convert one weights file.
 
     Args:
         source: ONNX file or checkpoint of the YOLOX reference implementation.
         destination: Checkpoint to write, holding the detector state dict under ``state_dict``.
         with_ema: Whether to also fill the averaged copy of the network.
+        parts: Parts of the network to keep, out of ``backbone``, ``neck`` and ``head``.
     """
     if source.suffix == ".onnx":
         state_dict = convert_folded_onnx(source, with_ema=with_ema)
     else:
         checkpoint = torch.load(str(source), map_location="cpu", weights_only=True)
         state_dict = convert_reference_checkpoint(checkpoint, with_ema=with_ema)
+    state_dict = select_parts(state_dict, parts)
     destination.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"state_dict": state_dict}, str(destination))
     logger.info("Wrote %d tensors to %s", len(state_dict), destination)
@@ -69,9 +89,16 @@ def main() -> None:
         action="store_true",
         help="Leave the averaged copy of the network out of the checkpoint.",
     )
+    parser.add_argument(
+        "--parts",
+        nargs="+",
+        choices=NETWORK_PARTS,
+        default=list(NETWORK_PARTS),
+        help="Parts of the network to keep in the checkpoint, all of them by default.",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    convert(args.source, args.destination, with_ema=not args.without_ema)
+    convert(args.source, args.destination, with_ema=not args.without_ema, parts=args.parts)
 
 
 if __name__ == "__main__":

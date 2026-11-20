@@ -23,14 +23,19 @@ import unittest
 
 import torch
 
+from autoware_ml.models.common.backbones.resnet import ResNet18MultiScale
 from autoware_ml.models.common.necks.yolox_pafpn import YOLOXPAFPN
+from autoware_ml.models.detection2d.heads.yolox import YOLOXHead
 from autoware_ml.models.detection2d.tests.yolox_fixtures import build_detector
-from autoware_ml.models.detection2d.yolox import YOLOXExportModule
+from autoware_ml.models.detection2d.yolox import YOLOXDetector, YOLOXExportModule
 from autoware_ml.models.detection2d.yolox_weights import (
     convert_folded_onnx,
     convert_reference_checkpoint,
     rename_reference_key,
+    select_parts,
 )
+from autoware_ml.models.module_base_model import LogDictConfigs
+from autoware_ml.preprocessing.data_preprocessor import DataPreprocessor
 from autoware_ml.scripts.tools.yolox.convert_weights import convert
 from autoware_ml.utils.checkpoints import apply_matching_weights
 
@@ -130,6 +135,84 @@ class TestReferenceCheckpoint(unittest.TestCase):
         self.assertEqual(set(report.shape_mismatched_keys), expected_skipped)
         self.assertEqual(report.unexpected_keys, ())
         self.assertEqual(set(report.not_loaded_model_keys), expected_skipped)
+
+    def test_backbone_only_weights_leave_the_neck_and_the_head_as_initialized(self) -> None:
+        """Test a checkpoint converted with the backbone as its only part.
+
+        Check: the checkpoint holds backbone tensors and the update count of the average
+        only, and loading it gives the detector the source backbone while the neck and the
+        head keep their initialization.
+        """
+        source = build_detector()
+        target = build_detector()
+        initial = {name: value.clone() for name, value in target.network.state_dict().items()}
+        with tempfile.TemporaryDirectory() as directory:
+            reference_path = Path(directory) / "reference.pth"
+            converted_path = Path(directory) / "backbone.ckpt"
+            torch.save({"model": _reference_state_dict(source)}, reference_path)
+            convert(reference_path, converted_path, parts=["backbone"])
+            keys = set(torch.load(converted_path, weights_only=True)["state_dict"])
+
+            (report,) = apply_matching_weights(target, converted_path)
+
+        backbone_keys = {
+            name for name in source.network.state_dict() if name.startswith("backbone.")
+        }
+        self.assertEqual(
+            keys,
+            {"network." + name for name in backbone_keys}
+            | {"ema.module." + name for name in backbone_keys}
+            | {"ema.num_updates"},
+        )
+        self.assertEqual(report.unexpected_keys, ())
+        for name, value in target.network.state_dict().items():
+            expected = source.network.state_dict()[name] if name in backbone_keys else initial[name]
+            torch.testing.assert_close(value, expected)
+
+    def test_neck_and_head_weights_load_below_another_backbone(self) -> None:
+        """Test a checkpoint converted with the neck and the head as its parts.
+
+        Check: loading it into a detector with a ResNet-18 backbone and another class count
+        leaves the backbone untouched, loads the neck and the head, and skips nothing but
+        the class outputs.
+        """
+        source = build_detector(num_classes=80, widen_factor=0.5)
+        backbone = ResNet18MultiScale(in_channels=3, out_indices=[1, 2, 3])
+        target = YOLOXDetector(
+            backbone=backbone,
+            neck=YOLOXPAFPN(in_channels=[128, 256, 512]),
+            head=YOLOXHead(num_classes=2, in_channels=[128, 256, 512], feat_channels=16),
+            log_dict_configs=LogDictConfigs(prog_bar=False),
+            data_preprocessor=DataPreprocessor(preprocessor_modules=[]),
+        )
+        initial_backbone = {name: value.clone() for name, value in backbone.state_dict().items()}
+        with tempfile.TemporaryDirectory() as directory:
+            reference_path = Path(directory) / "reference.pth"
+            converted_path = Path(directory) / "neck_head.ckpt"
+            torch.save({"model": _reference_state_dict(source)}, reference_path)
+            convert(reference_path, converted_path, parts=["neck", "head"])
+
+            (report,) = apply_matching_weights(target, converted_path, skip_mismatched_shapes=True)
+
+        self.assertEqual(report.unexpected_keys, ())
+        self.assertTrue(all(".head.cls_preds." in key for key in report.shape_mismatched_keys))
+        self.assertEqual(len(report.shape_mismatched_keys), 12)
+        self.assertTrue(all(".backbone." not in key for key in report.loaded_keys))
+        for name, value in backbone.state_dict().items():
+            torch.testing.assert_close(value, initial_backbone[name])
+        for name, value in source.network.neck.state_dict().items():
+            torch.testing.assert_close(target.network.neck.state_dict()[name], value)
+
+    def test_unknown_or_missing_parts_are_refused(self) -> None:
+        """Test that the parts to keep must be some of backbone, neck and head."""
+        state_dict = convert_reference_checkpoint(
+            {"model": _reference_state_dict(build_detector())}
+        )
+
+        with self.assertRaises(ValueError):
+            select_parts(state_dict, ["stem"])
+        with self.assertRaises(ValueError):
+            select_parts(state_dict, [])
 
 
 class TestFoldedONNX(unittest.TestCase):

@@ -80,6 +80,23 @@ autoware-ml train \
     --weights yolox_s_coco.ckpt --skip-mismatched-weights
 ```
 
+`convert_weights --parts` keeps a part of the weights only. `--parts backbone` writes a
+checkpoint that initializes the backbone and leaves the neck and the head at their own
+initialization; `--parts neck head` writes one that initializes the neck and the head below
+another backbone, which keeps its own weights:
+
+```bash
+python -m autoware_ml.scripts.tools.yolox.convert_weights yolox_s.pth yolox_s_coco_backbone.ckpt \
+    --parts backbone
+python -m autoware_ml.scripts.tools.yolox.convert_weights yolox_s.pth yolox_s_coco_neck_head.ckpt \
+    --parts neck head
+
+autoware-ml train \
+    --config-name detection2d/yolox/t4dataset/resnet18_960x960_tlr \
+    model.backbone.weights=IMAGENET1K_V1 \
+    --weights yolox_s_coco_neck_head.ckpt --skip-mismatched-weights
+```
+
 For a short schedule, set the validation cadence along with the epochs:
 
 ```bash
