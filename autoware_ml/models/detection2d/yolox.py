@@ -16,7 +16,8 @@
 
 The detector composes a backbone, a neck and the YOLOX head. The backbone returns the feature
 maps at strides 8, 16 and 32 and the neck fuses them, so another backbone or neck is a config
-change. The training recipe follows the YOLOX reference implementation
+change. A backbone that also returns the map at stride 4 gives the neck and the head a fourth
+level. The training recipe follows the YOLOX reference implementation
 (https://github.com/Megvii-BaseDetection/YOLOX, Apache-2.0): an exponential moving average of
 the weights is kept and evaluated, and the L1 box loss is turned on for the last epochs.
 """
@@ -154,8 +155,9 @@ class YOLOXDetector(ModuleBaseModel):
         """Initialize the detector.
 
         Args:
-            backbone: Image backbone returning the feature maps at strides 8, 16 and 32.
-            neck: Neck fusing the three feature maps.
+            backbone: Image backbone returning the feature maps at strides 8, 16 and 32,
+              preceded by the one at stride 4 for a detector of four levels.
+            neck: Neck fusing the feature maps.
             head: YOLOX head.
             log_dict_configs: Configuration for logging metrics in Lightning.
             input_channel_order: Channel order the backbone reads, ``bgr`` or ``rgb``.

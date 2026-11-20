@@ -23,6 +23,7 @@ import unittest
 
 import torch
 
+from autoware_ml.models.common.backbones.csp_darknet import CSPDarknet
 from autoware_ml.models.common.backbones.resnet import ResNet18MultiScale
 from autoware_ml.models.common.necks.yolox_pafpn import YOLOXPAFPN
 from autoware_ml.models.detection2d.heads.yolox import YOLOXHead
@@ -33,6 +34,7 @@ from autoware_ml.models.detection2d.yolox_weights import (
     convert_reference_checkpoint,
     rename_reference_key,
     select_parts,
+    shift_head_levels,
 )
 from autoware_ml.models.module_base_model import LogDictConfigs
 from autoware_ml.preprocessing.data_preprocessor import DataPreprocessor
@@ -107,6 +109,61 @@ class TestReferenceCheckpoint(unittest.TestCase):
         for name, value in source.network.state_dict().items():
             torch.testing.assert_close(target.network.state_dict()[name], value)
             torch.testing.assert_close(target.ema.module.state_dict()[name], value)
+
+    def test_head_levels_are_shifted_for_a_detector_with_a_finer_level(self) -> None:
+        """Test that a three-level checkpoint fills the three coarser levels of four.
+
+        Check: with an offset of 1, the head weights of level ``i`` land on level ``i + 1``
+        with matching shapes, the backbone and the neck keep their keys, and the only
+        tensors of the four-level detector left out belong to its stride 4 modules.
+        """
+        self.assertEqual(
+            shift_head_levels("head.stems.0.conv.weight", 1), "head.stems.1.conv.weight"
+        )
+        self.assertEqual(shift_head_levels("head.cls_preds.2.bias", 1), "head.cls_preds.3.bias")
+        self.assertEqual(
+            shift_head_levels("neck.C3_p4.conv1.bn.bias", 1), "neck.C3_p4.conv1.bn.bias"
+        )
+        self.assertEqual(
+            shift_head_levels("head.stems.0.conv.weight", 0), "head.stems.0.conv.weight"
+        )
+
+        torch.manual_seed(0)
+        source = build_detector()
+        backbone = CSPDarknet(deepen_factor=0.33, widen_factor=0.125, out_indices=[0, 1, 2, 3])
+        target = YOLOXDetector(
+            backbone=backbone,
+            neck=YOLOXPAFPN(in_channels=backbone.out_channels),
+            head=YOLOXHead(
+                num_classes=2,
+                in_channels=backbone.out_channels,
+                feat_channels=16,
+                strides=[4, 8, 16, 32],
+            ),
+            log_dict_configs=LogDictConfigs(prog_bar=False),
+            data_preprocessor=DataPreprocessor(preprocessor_modules=[]),
+        )
+
+        state_dict = convert_reference_checkpoint(
+            {"model": _reference_state_dict(source)}, head_level_offset=1
+        )
+        result = target.load_state_dict(state_dict, strict=False)
+
+        self.assertEqual(result.unexpected_keys, [])
+        fourth_level = ("reduce_conv2", "C3_p2", "bu_conv3", "C3_n2")
+        for key in result.missing_keys:
+            parts = key.removeprefix("ema.module.").removeprefix("network.").split(".")
+            self.assertTrue(
+                (parts[0] == "neck" and parts[1] in fourth_level)
+                or (parts[0] == "head" and parts[2] == "0"),
+                key,
+            )
+        torch.testing.assert_close(
+            target.network.head.stems[1].conv.weight, source.network.head.stems[0].conv.weight
+        )
+        torch.testing.assert_close(
+            target.network.head.reg_preds[3].weight, source.network.head.reg_preds[2].weight
+        )
 
     def test_class_outputs_of_another_class_count_are_the_only_skipped_tensors(self) -> None:
         """Test that weights of another class count load except for the class outputs.
