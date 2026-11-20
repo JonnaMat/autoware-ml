@@ -62,6 +62,27 @@ def rename_reference_key(key: str) -> str:
     raise ValueError(f"Unexpected key {key!r} in a YOLOX state dict.")
 
 
+def shift_head_levels(key: str, offset: int) -> str:
+    """Move a key of the head to the level ``offset`` positions coarser in the level order.
+
+    The head numbers its levels from the finest. A detector with a level at stride 4 in front
+    reads the weights of a three-level head, whose first level is at stride 8, one level up.
+
+    Args:
+        key: Key below the detector network.
+        offset: Number of levels the detector has in front of those of the weights.
+
+    Returns:
+        The key with the level index of a head module raised by ``offset``, any other key
+        as it is.
+    """
+    parts = key.split(".")
+    if offset == 0 or len(parts) < 3 or parts[0] != "head" or not parts[2].isdigit():
+        return key
+    parts[2] = str(int(parts[2]) + offset)
+    return ".".join(parts)
+
+
 def to_detector_state_dict(
     network_state_dict: Mapping[str, Tensor], with_ema: bool = True
 ) -> dict[str, Tensor]:
@@ -116,7 +137,7 @@ def select_parts(state_dict: Mapping[str, Tensor], parts: Sequence[str]) -> dict
 
 
 def convert_reference_checkpoint(
-    checkpoint: Mapping[str, object], with_ema: bool = True
+    checkpoint: Mapping[str, object], with_ema: bool = True, head_level_offset: int = 0
 ) -> dict[str, Tensor]:
     """Convert a checkpoint of the reference implementation.
 
@@ -124,12 +145,18 @@ def convert_reference_checkpoint(
         checkpoint: Loaded checkpoint, holding the weights under ``model`` or being the state
           dict itself.
         with_ema: Whether to also fill the averaged copy of the network.
+        head_level_offset: Number of finer levels the detector has in front of the levels of
+          the checkpoint, 1 for a detector with a level at stride 4, see
+          :func:`shift_head_levels`.
 
     Returns:
         State dict of the detector.
     """
     reference_state = checkpoint.get("model", checkpoint)
-    network_state = {rename_reference_key(key): value for key, value in reference_state.items()}
+    network_state = {
+        shift_head_levels(rename_reference_key(key), head_level_offset): value
+        for key, value in reference_state.items()
+    }
     return to_detector_state_dict(network_state, with_ema=with_ema)
 
 

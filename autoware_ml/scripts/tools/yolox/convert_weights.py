@@ -59,6 +59,7 @@ def convert(
     destination: Path,
     with_ema: bool = True,
     parts: Sequence[str] = NETWORK_PARTS,
+    head_level_offset: int = 0,
 ) -> None:
     """Convert one weights file.
 
@@ -67,12 +68,21 @@ def convert(
         destination: Checkpoint to write, holding the detector state dict under ``state_dict``.
         with_ema: Whether to also fill the averaged copy of the network.
         parts: Parts of the network to keep, out of ``backbone``, ``neck`` and ``head``.
+        head_level_offset: Number of finer levels the detector has in front of the levels of
+          a checkpoint, 1 for a detector with a level at stride 4.
+
+    Raises:
+        ValueError: If a level offset is asked for an ONNX file.
     """
+    if source.suffix == ".onnx" and head_level_offset != 0:
+        raise ValueError("The head levels of an ONNX file are not shifted, convert a checkpoint.")
     if source.suffix == ".onnx":
         state_dict = convert_folded_onnx(source, with_ema=with_ema)
     else:
         checkpoint = torch.load(str(source), map_location="cpu", weights_only=True)
-        state_dict = convert_reference_checkpoint(checkpoint, with_ema=with_ema)
+        state_dict = convert_reference_checkpoint(
+            checkpoint, with_ema=with_ema, head_level_offset=head_level_offset
+        )
     state_dict = select_parts(state_dict, parts)
     destination.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"state_dict": state_dict}, str(destination))
@@ -96,9 +106,22 @@ def main() -> None:
         default=list(NETWORK_PARTS),
         help="Parts of the network to keep in the checkpoint, all of them by default.",
     )
+    parser.add_argument(
+        "--head-level-offset",
+        type=int,
+        default=0,
+        help="Finer levels the detector has in front of those of the checkpoint: 1 for a "
+        "detector with a level at stride 4, whose head then reads the weights one level up.",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    convert(args.source, args.destination, with_ema=not args.without_ema, parts=args.parts)
+    convert(
+        args.source,
+        args.destination,
+        with_ema=not args.without_ema,
+        parts=args.parts,
+        head_level_offset=args.head_level_offset,
+    )
 
 
 if __name__ == "__main__":
