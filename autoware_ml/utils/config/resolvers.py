@@ -80,6 +80,26 @@ def class_count(class_names: Iterable[Any]) -> int:
     return len(list(class_names))
 
 
+def multiply(*factors: float) -> float:
+    """Product of several numbers.
+
+    A value that scales with another one is derived instead of restated, for example a
+    learning rate that follows the batch size::
+
+        lr: ${multiply:${base_lr_per_image},${global_batch_size}}
+
+    Args:
+        *factors: Numbers to multiply.
+
+    Returns:
+        The product of the factors.
+    """
+    product = 1.0
+    for factor in factors:
+        product *= float(factor)
+    return product
+
+
 def register_config_resolvers(settings: Settings) -> None:
     """Register all custom OmegaConf resolvers required by bundled configs.
 
@@ -89,6 +109,7 @@ def register_config_resolvers(settings: Settings) -> None:
     OmegaConf.register_new_resolver("user_config_name", strip_tasks_prefix, replace=True)
     OmegaConf.register_new_resolver("merge_lists", merge_lists, replace=True)
     OmegaConf.register_new_resolver("class_count", class_count, replace=True)
+    OmegaConf.register_new_resolver("multiply", multiply, replace=True)
     OmegaConf.register_new_resolver("data_path", settings.resolve_data_path, replace=True)
     OmegaConf.register_new_resolver("cache_path", settings.resolve_cache_path, replace=True)
     OmegaConf.register_new_resolver("working_dir", settings.resolve_working_dir, replace=True)

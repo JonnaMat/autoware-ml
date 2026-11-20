@@ -27,6 +27,7 @@ from omegaconf.errors import InterpolationResolutionError
 from autoware_ml.utils.config.settings import CONFIGS_ROOT, PROJECT_ROOT, Settings
 from autoware_ml.utils.config.resolvers import (
     merge_lists,
+    multiply,
     register_config_resolvers,
 )
 
@@ -35,6 +36,19 @@ def test_merge_lists_concatenates_in_order() -> None:
     assert OmegaConf.to_container(merge_lists([1, 2], [3], [4, 5])) == [1, 2, 3, 4, 5]
     assert OmegaConf.to_container(merge_lists([])) == []
     assert OmegaConf.to_container(merge_lists()) == []
+
+
+def test_multiply_resolver_scales_a_value_by_another() -> None:
+    register_config_resolvers(Settings())
+    cfg = OmegaConf.create(
+        {
+            "base_lr_per_image": 0.00015625,
+            "global_batch_size": 64,
+            "lr": "${multiply:${base_lr_per_image},${global_batch_size}}",
+        }
+    )
+    assert cfg.lr == pytest.approx(0.01)
+    assert multiply(2, 3, 0.5) == pytest.approx(3.0)
 
 
 def test_merge_lists_resolver_appends_across_namespaces() -> None:
