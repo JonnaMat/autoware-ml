@@ -31,7 +31,46 @@ class ScenarioSplitter:
     """
     Common Splitter class to split a sequence of DatasetRecord into different splits
     (e.g. train, val, test) based on the given scenarios.
+
+    A database may list no scenario for a split, typically no validation scenario. A
+    ``split_fallbacks`` entry then serves that split with the scenarios of another one,
+    ``{val: test}`` to validate on the test scenarios. A split that lists scenarios of its own
+    never falls back.
     """
+
+    def __init__(self, split_fallbacks: Mapping[str, str] | None = None) -> None:
+        """
+        Initialize the splitter.
+
+        Args:
+          split_fallbacks: Split to the split whose scenarios serve it when it lists none,
+            both named by their SplitType value.
+        """
+        self.split_fallbacks: dict[SplitType, SplitType] = {
+            SplitType(split): SplitType(fallback)
+            for split, fallback in (split_fallbacks or {}).items()
+        }
+
+    def _scenario_ids_by_split(
+        self, scenarios: MappingProxyType[str, Scenarios]
+    ) -> Mapping[SplitType, set[str]]:
+        """
+        Collect the scenario IDs of every split, applying the fallbacks of the empty ones.
+
+        Args:
+          scenarios: Scenario data of every scenario group.
+
+        Returns:
+          Mapping[SplitType, set[str]]: Scenario IDs by split.
+        """
+        scenario_ids_by_split: Mapping[SplitType, set[str]] = defaultdict(set)
+        for scenarios_obj in scenarios.values():
+            for split, scenario_data_list in scenarios_obj.scenario_data.items():
+                scenario_ids_by_split[split].update(sd.scenario_id for sd in scenario_data_list)
+        for split, fallback in self.split_fallbacks.items():
+            if not scenario_ids_by_split.get(split):
+                scenario_ids_by_split[split] = set(scenario_ids_by_split.get(fallback, set()))
+        return scenario_ids_by_split
 
     def __str__(self) -> str:
         """
@@ -57,10 +96,7 @@ class ScenarioSplitter:
         Returns:
           MappingProxyType[SplitType, Sequence[DatasetRecord]]: Mapping from split type to sequence of dataset records in that split.
         """
-        scenario_ids_by_split: Mapping[SplitType, set[str]] = defaultdict(set)
-        for scenarios_obj in scenarios.values():
-            for split, scenario_data_list in scenarios_obj.scenario_data.items():
-                scenario_ids_by_split[split].update(sd.scenario_id for sd in scenario_data_list)
+        scenario_ids_by_split = self._scenario_ids_by_split(scenarios)
 
         records_by_scenario_id: Mapping[str, list[DatasetRecord]] = defaultdict(list)
         for record in dataset_records:
@@ -90,10 +126,7 @@ class ScenarioSplitter:
         Returns:
           MappingProxyType[SplitType, pl.DataFrame]: Mapping from split type to Polars DataFrame of dataset records in that split.
         """
-        scenario_ids_by_split: Mapping[SplitType, set[str]] = defaultdict(set)
-        for scenarios_obj in scenarios.values():
-            for split, scenario_data_list in scenarios_obj.scenario_data.items():
-                scenario_ids_by_split[split].update(sd.scenario_id for sd in scenario_data_list)
+        scenario_ids_by_split = self._scenario_ids_by_split(scenarios)
 
         split_dfs: Mapping[SplitType, pl.DataFrame] = {}
         for split, scenario_ids in scenario_ids_by_split.items():
