@@ -1,0 +1,8 @@
+# @package _global_
+# Whole-image traffic light detector with an HGNetV2-B1 backbone under the YOLOX neck and head.
+defaults:
+  - base_960x960_tlr
+  - ../backbone_hgnetv2_b1
+  - _self_
+
+experiment_name: hgnetv2_b1_960x960_tlr
