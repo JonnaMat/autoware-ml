@@ -1,0 +1,14 @@
+# @package _global_
+# CSPDarknet of YOLOX-S: depth 0.33, width 0.5. Reads BGR in [0, 255], as the YOLOX weights do.
+model:
+  input_channel_order: bgr
+  input_mean: null
+  input_std: null
+
+  backbone:
+    _target_: autoware_ml.models.common.backbones.csp_darknet.CSPDarknet
+    deepen_factor: 0.33
+    widen_factor: 0.5
+    out_indices: [1, 2, 3]
+  neck:
+    in_channels: [128, 256, 512]

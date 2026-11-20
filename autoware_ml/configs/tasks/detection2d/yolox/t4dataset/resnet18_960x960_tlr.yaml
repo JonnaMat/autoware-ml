@@ -1,0 +1,8 @@
+# @package _global_
+# Whole-image traffic light detector with a ResNet-18 backbone under the YOLOX neck and head.
+defaults:
+  - base_960x960_tlr
+  - ../backbone_resnet18
+  - _self_
+
+experiment_name: resnet18_960x960_tlr

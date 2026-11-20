@@ -28,6 +28,7 @@ from autoware_ml.utils.deploy import validate_onnx_names_not_configured
 # Building blocks and bases are not runnable on their own, only the leaves are.
 _BLOCKS = (
     "base",
+    "backbone",
     "large",
     "bev_neck",
     "encoder",

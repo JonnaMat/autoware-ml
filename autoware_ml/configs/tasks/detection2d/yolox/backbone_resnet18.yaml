@@ -1,0 +1,16 @@
+# @package _global_
+# ResNet-18 of torchvision. Its ImageNet weights read RGB normalized by the ImageNet statistics,
+# which the detector applies inside the network: the deployed graph still takes raw pixels.
+model:
+  input_channel_order: rgb
+  input_mean: [123.675, 116.28, 103.53]
+  input_std: [58.395, 57.12, 57.375]
+
+  backbone:
+    _target_: autoware_ml.models.common.backbones.resnet.ResNet18MultiScale
+    in_channels: 3
+    out_indices: [1, 2, 3]
+    # Set to IMAGENET1K_V1 to start from the ImageNet weights of torchvision.
+    weights: null
+  neck:
+    in_channels: [128, 256, 512]

@@ -1,0 +1,115 @@
+# @package _global_
+defaults:
+  - ../base
+  # The metric suites and the datamodule belong to the evaluated database, so the input size
+  # base composes them. Loaded before _self_ so the overrides below win over the defaults.
+  - /metrics/t4dataset/detection2d/default_detection2d_metrics
+  - /metrics/t4dataset/detection2d@metrics: default_detection2d_metric_suites
+  - /datamodule@datamodule: t4dataset/default_detection2d_datamodule
+  # The experiment selects the taxonomy that folds the labels of its database onto the classes
+  - /database/t4dataset/taxonomy/detection2d@taxonomy.detection2d: ???
+  - _self_
+
+image_size: [960, 960]
+# A 2D suite slices by box size, not by distance.
+metric_ranges: []
+
+# Factor the JPEG decoder shrinks a training image by while decoding (1, 2, 4 or 8). A camera
+# image several times larger than the network input decodes much faster at a reduced size.
+# The evaluation pipeline always decodes at full size.
+train_decoding_reduction: 1
+# Range the random affine draws the scale of a mosaic from.
+mosaic_scale_range: [0.1, 2.0]
+# Shortest side in pixels of the network input a box must keep through the augmentation.
+min_box_side: 2.0
+
+datasets:
+  train:
+    transforms:
+      _target_: autoware_ml.transforms.base.TransformsCompose
+      _convert_: all
+
+      pipeline:
+        # Loads the image resized to fit the network input, every later step works on it.
+        - _target_: autoware_ml.transforms.detection2d.loading.LoadImageAndResize
+          _convert_: all
+
+          image_size: ${image_size}
+          decoding_reduction: ${train_decoding_reduction}
+
+        # Mosaic, random affine and mixup are the strong augmentations: the
+        # strong_augmentation_schedule callback turns them off for the last no_aug_epochs.
+        - _target_: autoware_ml.transforms.detection2d.augmentation.Mosaic
+          _convert_: all
+
+          image_size: ${image_size}
+          probability: 1.0
+          switch_name: strong_augmentation
+
+        - _target_: autoware_ml.transforms.detection2d.augmentation.RandomAffine
+          _convert_: all
+
+          image_size: ${image_size}
+          max_rotation_degrees: 10.0
+          max_translation_ratio: 0.1
+          scale_range: ${mosaic_scale_range}
+          max_shear_degrees: 2.0
+          switch_name: strong_augmentation
+
+        - _target_: autoware_ml.transforms.detection2d.augmentation.MixUp
+          _convert_: all
+
+          image_size: ${image_size}
+          scale_range: [0.5, 1.5]
+          probability: 1.0
+          switch_name: strong_augmentation
+
+        - _target_: autoware_ml.transforms.detection2d.augmentation.HSVAugmentation
+          _convert_: all
+
+          hue_gain: 5.0
+          saturation_gain: 30.0
+          value_gain: 30.0
+
+        # A mirrored light is still a light: the two classes do not tell arrows apart.
+        - _target_: autoware_ml.transforms.detection2d.augmentation.RandomHorizontalFlip
+          _convert_: all
+
+          probability: 0.5
+
+        - _target_: autoware_ml.transforms.detection2d.formatting.Letterbox
+          _convert_: all
+
+          image_size: ${image_size}
+          pad_value: 114.0
+
+        - _target_: autoware_ml.transforms.detection2d.formatting.FilterSmallBoxes2D
+          _convert_: all
+
+          min_side: ${min_box_side}
+
+  test:
+    transforms:
+      _target_: autoware_ml.transforms.base.TransformsCompose
+      _convert_: all
+
+      pipeline:
+        - _target_: autoware_ml.transforms.detection2d.loading.LoadImageAndResize
+          _convert_: all
+
+          image_size: ${image_size}
+
+        # The letterbox of the runtime: aspect ratio kept, top left aligned, padded with 114.
+        - _target_: autoware_ml.transforms.detection2d.formatting.Letterbox
+          _convert_: all
+
+          image_size: ${image_size}
+          pad_value: 114.0
+
+# Batch size and workers reach every dataloader from the top level, only the exceptions go here.
+datamodule:
+  train_dataloader:
+    shuffle: true
+    drop_last: true
+  predict_dataloader:
+    batch_size: 1

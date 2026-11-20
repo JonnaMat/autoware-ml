@@ -1,0 +1,18 @@
+# T4 database of camera images annotated with 2D boxes (annotation/object_ann.json), one record
+# per camera image. A database of this kind extends this config with its scenarios.
+_target_: autoware_ml.databases.t4dataset.t4dataset_2d.T4Dataset2D
+_convert_: all
+
+defaults:
+  - taxonomy/vocabulary@vocabulary: ???
+
+root_path: ${data_root_path}/t4dataset/
+# Prefix name of the cache file, it will be <cache_file_prefix_name>_<database_hash>.parquet
+cache_file_prefix_name: database_2d
+
+# Camera channels whose images are served, null for every camera of a scene
+camera_channels: null
+# Only the key frames of a camera are annotated
+keyframes_only: true
+
+num_workers: 16

@@ -1,0 +1,125 @@
+# @package _global_
+# YOLOX 2D detector with the training recipe of the YOLOX reference implementation
+# (https://github.com/Megvii-BaseDetection/YOLOX). The defaults are those of YOLOX-S. The
+# backbone is a block of its own (backbone_*.yaml) a leaf composes, so two leaves differing in
+# their backbone share the neck, the head, the data, the augmentation and the metrics.
+defaults:
+  - /tasks/default_task
+  - _self_
+
+database: ???
+# [height, width] of the network input, both divisible by 32
+image_size: ???
+
+# Epochs of the quadratic learning rate warmup at the start of the run.
+warmup_epochs: 5
+# Last epochs of the run, trained without mosaic, random affine and mixup, with the L1 box loss
+# and at the minimum learning rate.
+no_aug_epochs: 15
+# The learning rate follows the number of images of one optimization step over every GPU:
+# lr = base_lr_per_image * global_batch_size, 0.01 for 64 images. Set global_batch_size to
+# batch_size times the number of GPUs.
+base_lr_per_image: 0.00015625
+global_batch_size: ${batch_size}
+
+# Monitored by the best checkpoint and returned to a hyperparameter search.
+optimized_metric: val/det2d/ap_small
+
+optimizer:
+  _target_: torch.optim.SGD
+  _partial_: true
+  lr: ${multiply:${base_lr_per_image},${global_batch_size}}
+  momentum: 0.9
+  nesterov: true
+  weight_decay: 5.0e-4
+
+trainer:
+  max_epochs: 300
+  # fp16 autocast, the losses and the label assignment stay in fp32. 32-true turns it off.
+  precision: 16-mixed
+
+callbacks:
+  model_checkpoint:
+    monitor: ${optimized_metric}
+    mode: max
+  # A detector trained with strong augmentation improves until the end of its schedule.
+  early_stopping: null
+  strong_augmentation_schedule:
+    _target_: autoware_ml.callbacks.strong_augmentation_schedule.StrongAugmentationSchedule
+    num_last_epochs: ${no_aug_epochs}
+    switch_name: strong_augmentation
+
+deploy:
+  onnx:
+    dynamo: false
+    opset_version: 17
+    modules:
+      end_to_end: {}
+  tensorrt:
+    enabled: false
+
+model:
+  _target_: autoware_ml.models.detection2d.yolox.YOLOXDetector
+  metrics: ${metrics}
+  log_dict_configs:
+    _target_: autoware_ml.models.module_base_model.LogDictConfigs
+    _convert_: all
+    on_step: false
+    on_epoch: true
+    prog_bar: true
+    sync_dist: true
+
+  # The images are served as RGB in [0, 255]. The YOLOX weights read BGR without normalization.
+  input_channel_order: bgr
+  input_mean: null
+  input_std: null
+
+  # Exponential moving average of the weights, evaluated and exported in place of the weights.
+  use_ema: true
+  ema_decay: 0.9998
+  ema_warmup_updates: 2000
+
+  # Decoding of the evaluated detections. The average precision needs the low scored ones too.
+  score_threshold: 0.01
+  nms_iou_threshold: 0.65
+  class_agnostic_nms: false
+  max_detections: 300
+
+  # Whether the exported graph outputs a leading background class score that is always zero.
+  export_background_class: false
+
+  # The backbone returns the feature maps at strides 8, 16 and 32. A leaf composes one of the
+  # backbone_* blocks, which also tells the neck the channels of those feature maps.
+  backbone: ???
+  neck:
+    _target_: autoware_ml.models.common.necks.yolox_pafpn.YOLOXPAFPN
+    in_channels: ???
+    deepen_factor: 0.33
+  head:
+    _target_: autoware_ml.models.detection2d.heads.yolox.YOLOXHead
+    num_classes: ${class_count:${taxonomy.detection2d.class_names}}
+    in_channels: ${model.neck.in_channels}
+    feat_channels: 128
+    strides: [8, 16, 32]
+    iou_loss_weight: 5.0
+    assigner:
+      _target_: autoware_ml.models.detection2d.task_modules.simota.SimOTAAssigner
+      center_radius: 1.5
+      candidate_topk: 10
+      iou_weight: 3.0
+
+  optimizer: ${optimizer}
+  # Biases and normalization weights are not decayed.
+  optimizer_group_overrides:
+    no_decay:
+      weight_decay: 0.0
+  scheduler:
+    _target_: autoware_ml.utils.schedulers.yolox_warm_cosine.YOLOXWarmCosineLR
+    _partial_: true
+    max_epochs: ${trainer.max_epochs}
+    warmup_epochs: ${warmup_epochs}
+    no_aug_epochs: ${no_aug_epochs}
+    warmup_start_factor: 0.0
+    min_lr_factor: 0.05
+  scheduler_config:
+    interval: step

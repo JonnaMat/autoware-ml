@@ -1,0 +1,35 @@
+# @package _global_
+# Whole-image traffic light detector at 960x960 over the two kinds of traffic lights. The leaves
+# add the backbone.
+defaults:
+  - base_960x960
+  - /database@database: t4dataset/t4dataset_tlr
+  - override /database/t4dataset/taxonomy/detection2d@taxonomy.detection2d: traffic_light
+  - _self_
+
+taxonomy:
+  detection2d:
+    class_names: [traffic_light, pedestrian_traffic_light]
+
+batch_size: 8
+num_workers: 8
+experiment_group_name: yolox/${database.version}/t4dataset
+experiment_name: ???
+
+# The camera images are three times the width of the network input.
+train_decoding_reduction: 2
+
+model:
+  # The label list of the traffic light runtime starts with a background entry.
+  export_background_class: true
+
+datamodule:
+  # The database lists no validation scenes, the run validates on its test scenes.
+  splitter:
+    split_fallbacks:
+      val: test
+
+callbacks:
+  dynamic_validation:
+    # Validate every 10 epochs, then every epoch over the last no_aug_epochs.
+    epoch_intervals: [[0, 10], [285, 1]]

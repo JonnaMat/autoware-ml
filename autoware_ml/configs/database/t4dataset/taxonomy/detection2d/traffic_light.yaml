@@ -1,0 +1,12 @@
+# Traffic light detection2d taxonomy: the two kinds of traffic lights as they are.
+_target_: autoware_ml.databases.taxonomy.LabelTaxonomy
+
+defaults:
+  - /database/t4dataset/taxonomy/vocabulary@vocabulary: traffic_light
+  - _self_
+
+ignore_index: -1
+class_names: ???
+class_mapping:
+  traffic_light: traffic_light
+  pedestrian_traffic_light: pedestrian_traffic_light

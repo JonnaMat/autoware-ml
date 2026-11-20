@@ -1,0 +1,18 @@
+# @package metric_params.detection2d
+
+# Size bins of the average precision, by name: [min, max) of the square root of the box area
+# in pixels of the original image, null for no upper end.
+size_bins:
+  tiny: [0, 16]
+  small: [16, 32]
+  medium: [32, 64]
+  large: [64, null]
+# Size bin reported as `ap_small`, the value the best checkpoint is selected by.
+small_bin: tiny
+
+iou_thresholds: [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+# Highest scored detections per image and class that are evaluated
+max_detections: 100
+# Operating point of the reported recall and precision
+operating_score_threshold: 0.35
+operating_iou_threshold: 0.5

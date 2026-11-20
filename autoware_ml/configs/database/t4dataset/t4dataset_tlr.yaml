@@ -1,0 +1,10 @@
+# Traffic light recognition database: whole camera images with the 2D boxes of the traffic
+# lights for vehicles and for pedestrians.
+defaults:
+  - t4dataset/t4dataset_2d_common@_here_
+  - t4dataset/scenarios@scenarios.db_tlr: detection2d/db_tlr
+  - override t4dataset/taxonomy/vocabulary@vocabulary: traffic_light
+  - _self_
+
+version: T4Dataset-tlr-v1.0.0
+cache_path: ${cache_root_path}/t4dataset/

@@ -1,0 +1,12 @@
+# 2D detection metric suite: COCO style average precision, per class and per box size.
+- _target_: autoware_ml.metrics.detection2d.suite.Detection2DMetricSuite
+  class_names: ${taxonomy.detection2d.class_names}
+  components:
+    - _target_: autoware_ml.metrics.detection2d.average_precision.COCOAveragePrecision
+      _convert_: all
+      size_bins: ${metric_params.detection2d.size_bins}
+      small_bin: ${metric_params.detection2d.small_bin}
+      iou_thresholds: ${metric_params.detection2d.iou_thresholds}
+      max_detections: ${metric_params.detection2d.max_detections}
+      operating_score_threshold: ${metric_params.detection2d.operating_score_threshold}
+      operating_iou_threshold: ${metric_params.detection2d.operating_iou_threshold}

@@ -1,0 +1,15 @@
+_target_: autoware_ml.datamodule.t4dataset.detection2d.T4Detection2DDataset
+_convert_: all
+
+taxonomy: ${taxonomy.detection2d}
+
+# Number of 2D boxes every sample is padded to in a batch, the first `max_num_2d_gt_bboxes`
+# boxes of a sample holding more are kept. A mosaic holds the boxes of four images and a mixup
+# those of one more.
+max_num_2d_gt_bboxes: 300
+
+# Database the dataset reads. A source over another database composes its own copy of this
+# config with that database's values.
+database_root_path: ${database.root_path}
+
+transforms: ???
