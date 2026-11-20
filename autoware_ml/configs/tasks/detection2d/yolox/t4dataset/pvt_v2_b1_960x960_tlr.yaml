@@ -1,0 +1,9 @@
+# @package _global_
+# Whole-image traffic light detector with a PVT v2 B1 backbone.
+defaults:
+  - base_960x960_tlr
+  - ../backbone_pvt_v2_b1
+  - ../backbone_optimizer_adamw
+  - _self_
+
+experiment_name: pvt_v2_b1_960x960_tlr

@@ -1,0 +1,14 @@
+# @package _global_
+# Whole-image traffic light detector with a DINOv2 ViT-S backbone attending within windows.
+defaults:
+  - base_960x960_tlr
+  - ../backbone_vit_s_dinov2
+  - ../backbone_optimizer_adamw
+  - _self_
+
+experiment_name: vit_s_dinov2_window_960x960_tlr
+
+model:
+  backbone:
+    # 16 windows of 15x15 tokens over the 60x60 patch grid, 240x240 pixels each.
+    window_size: 15

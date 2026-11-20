@@ -1,0 +1,30 @@
+# @package _global_
+# ViT-S of DINOv2 with a simple feature pyramid (ViTDet). The weights are those of patch size
+# 14: the kernel of the patch embedding is resampled to 16 and the position embedding to the
+# patch grid of the input when they load, so the network keeps the input size of the other
+# backbones and its token map is at stride 16. The weights read RGB normalized by the ImageNet
+# statistics, which the detector applies inside the network: the deployed graph still takes
+# raw pixels.
+model:
+  input_channel_order: rgb
+  input_mean: [123.675, 116.28, 103.53]
+  input_std: [58.395, 57.12, 57.375]
+
+  backbone:
+    _target_: autoware_ml.models.common.backbones.vit.ViTSimplePyramid
+    # vit_small_patch14_reg4_dinov2.lvd142m is the same network with four register tokens.
+    model_name: vit_small_patch14_dinov2.lvd142m
+    image_size: ${image_size}
+    patch_size: 16
+    # Set to true to start a training from the weights of timm, which downloads them. A run
+    # that loads a detector checkpoint needs none.
+    pretrained: false
+    # Side of the attention windows in tokens, null for global attention in every block.
+    window_size: null
+    # Blocks attending over the whole image when the others attend within windows.
+    global_block_indices: [2, 5, 8, 11]
+    # Feature maps at strides 8, 16 and 32, as wide as those of the YOLOX-S backbone.
+    out_channels: [128, 256, 512]
+    drop_path_rate: 0.0
+  neck:
+    in_channels: ${model.backbone.out_channels}

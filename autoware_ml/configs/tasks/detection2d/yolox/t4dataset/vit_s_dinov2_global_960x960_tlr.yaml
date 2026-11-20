@@ -1,0 +1,9 @@
+# @package _global_
+# Whole-image traffic light detector with a DINOv2 ViT-S backbone, every block attending globally.
+defaults:
+  - base_960x960_tlr
+  - ../backbone_vit_s_dinov2
+  - ../backbone_optimizer_adamw
+  - _self_
+
+experiment_name: vit_s_dinov2_global_960x960_tlr
