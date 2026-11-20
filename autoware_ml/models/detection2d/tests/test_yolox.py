@@ -23,6 +23,7 @@ import tempfile
 import unittest
 
 import numpy as np
+import onnx
 import onnxruntime as ort
 import torch
 
@@ -35,6 +36,33 @@ from autoware_ml.models.detection2d.tests.yolox_fixtures import build_batch_inpu
 from autoware_ml.models.detection2d.yolox import YOLOXDetector
 from autoware_ml.models.module_base_model import LogDictConfigs
 from autoware_ml.preprocessing.data_preprocessor import DataPreprocessor
+from autoware_ml.utils.deploy import ExportSpec
+
+
+def _run_exported_graph(spec: ExportSpec, images: torch.Tensor) -> tuple[bytes, np.ndarray]:
+    """Export a graph the way the deployment does and run it in ONNX Runtime.
+
+    Args:
+        spec: Export specification of a detector.
+        images: Images the graph is given.
+
+    Returns:
+        The serialized graph and its output for the images.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        onnx_path = Path(directory) / "detector.onnx"
+        torch.onnx.export(
+            spec.module,
+            spec.args,
+            str(onnx_path),
+            input_names=spec.input_names,
+            output_names=spec.output_names,
+            opset_version=17,
+            dynamo=False,
+        )
+        graph = onnx.load(str(onnx_path)).graph.SerializeToString(deterministic=True)
+        session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        return graph, session.run(None, {"images": images.numpy()})[0]
 
 
 class TestYOLOXDetector(unittest.TestCase):
@@ -239,6 +267,75 @@ class TestYOLOXExport(unittest.TestCase):
             gt_boxes=[torch.tensor([[8.0, 8.0, 40.0, 40.0]])],
             gt_labels=[torch.tensor([0])],
         )
+
+    def test_exported_graph_reads_the_configured_channel_order(self) -> None:
+        """Test that a graph deployed for BGR input feeds an RGB backbone the reversed channels.
+
+        Check: the graph of an RGB detector exported for BGR, given the BGR image, equals the
+        graph exported in the order of the backbone given the RGB image; the example input of
+        the export is the BGR image.
+        """
+        torch.manual_seed(0)
+        detector = build_detector(input_channel_order="rgb", use_ema=False).eval()
+        for_runtime = build_detector(
+            input_channel_order="rgb", export_input_channel_order="bgr", use_ema=False
+        ).eval()
+        for_runtime.load_state_dict(detector.state_dict())
+        rgb = self.batch.image_data.images[:, 0]
+
+        native_spec = detector.build_export_spec(self.batch)
+        runtime_spec = for_runtime.build_export_spec(self.batch)
+
+        torch.testing.assert_close(native_spec.args[0], rgb)
+        torch.testing.assert_close(runtime_spec.args[0], rgb.flip(1))
+        with torch.no_grad():
+            torch.testing.assert_close(
+                runtime_spec.module(runtime_spec.args[0]), native_spec.module(native_spec.args[0])
+            )
+        with self.assertRaises(ValueError):
+            build_detector(export_input_channel_order="gbr")
+
+    def test_onnx_graph_of_an_rgb_backbone_takes_the_bgr_image_of_the_runtime(self) -> None:
+        """Test the deployed graph of a normalizing RGB backbone against the detector.
+
+        Check: ONNX Runtime, given the BGR image in [0, 255] a YOLOX runtime delivers, returns
+        what the detector predicts for the same image served as RGB by the data pipeline.
+        """
+        torch.manual_seed(0)
+        detector = build_detector(
+            input_channel_order="rgb",
+            input_mean=[123.675, 116.28, 103.53],
+            input_std=[58.395, 57.12, 57.375],
+            export_input_channel_order="bgr",
+        ).eval()
+        bgr = self.batch.image_data.images[:, 0].flip(1)
+
+        onnx_output = _run_exported_graph(detector.build_export_spec(self.batch), bgr)[1]
+
+        with torch.no_grad():
+            raw = detector(self.batch).detection2d().predictions
+        expected = torch.cat([raw[..., :4], raw[..., 4:].sigmoid()], dim=-1)
+        np.testing.assert_allclose(onnx_output, expected.numpy(), atol=1e-5, rtol=1e-4)
+
+    def test_onnx_graph_of_a_bgr_backbone_is_the_same_for_a_bgr_runtime(self) -> None:
+        """Test that deploying a BGR backbone for a BGR runtime adds nothing to its graph.
+
+        Check: the graph exported with the BGR export order is node for node and weight for
+        weight the graph exported in the order of the backbone, and returns the same output.
+        """
+        for_runtime = build_detector(
+            export_background_class=True, export_input_channel_order="bgr"
+        ).eval()
+        for_runtime.load_state_dict(self.detector.state_dict())
+        bgr = self.batch.image_data.images[:, 0].flip(1)
+
+        graph, output = _run_exported_graph(self.detector.build_export_spec(self.batch), bgr)
+        runtime_graph, runtime_output = _run_exported_graph(
+            for_runtime.build_export_spec(self.batch), bgr
+        )
+
+        self.assertEqual(runtime_graph, graph)
+        np.testing.assert_array_equal(runtime_output, output)
 
     def test_export_spec_names_the_tensors_of_the_runtime(self) -> None:
         """Test the export contract: tensor names, the BGR input and the output layout.

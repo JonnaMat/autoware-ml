@@ -87,6 +87,9 @@ model:
 
   # Whether the exported graph outputs a leading background class score that is always zero.
   export_background_class: false
+  # Channel order the exported graph reads, whatever order the backbone reads: the YOLOX
+  # runtimes deliver BGR. null exports the order of the backbone.
+  export_input_channel_order: bgr
 
   # The backbone returns the feature maps at strides 8, 16 and 32. A leaf composes one of the
   # backbone_* blocks, which also tells the neck the channels of those feature maps.

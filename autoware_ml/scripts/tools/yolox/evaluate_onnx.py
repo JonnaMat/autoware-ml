@@ -77,7 +77,9 @@ def build_onnx_detector(cfg: DictConfig) -> ONNXYOLOXDetector:
         log_dict_configs=hydra.utils.instantiate(model_cfg.log_dict_configs),
         data_preprocessor=build_data_preprocessor(cfg),
         metrics=hydra.utils.instantiate(cfg.metrics),
-        input_channel_order=model_cfg.input_channel_order,
+        # The graph reads the order it was exported for, not necessarily that of the backbone.
+        input_channel_order=model_cfg.get("export_input_channel_order")
+        or model_cfg.input_channel_order,
         score_threshold=model_cfg.score_threshold,
         nms_iou_threshold=model_cfg.nms_iou_threshold,
         class_agnostic_nms=model_cfg.class_agnostic_nms,

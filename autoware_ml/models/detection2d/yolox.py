@@ -148,6 +148,7 @@ class YOLOXDetector(ModuleBaseModel):
         class_agnostic_nms: bool = False,
         max_detections: int | None = 300,
         export_background_class: bool = False,
+        export_input_channel_order: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the detector.
@@ -172,10 +173,14 @@ class YOLOXDetector(ModuleBaseModel):
             export_background_class: Whether the deployed graph outputs a leading background
               class score that is always zero, for runtimes whose label list starts with a
               background entry.
+            export_input_channel_order: Channel order the deployed graph reads, ``bgr`` or
+              ``rgb``. When it differs from ``input_channel_order`` the graph reorders the
+              channels itself, so every backbone is deployed behind the same input. None
+              deploys the order the backbone reads.
             **kwargs: Arguments of :class:`ModuleBaseModel`.
 
         Raises:
-            ValueError: If the channel order is neither ``bgr`` nor ``rgb``.
+            ValueError: If a channel order is neither ``bgr`` nor ``rgb``.
         """
         super().__init__(log_dict_configs=log_dict_configs, **kwargs)
         self.network = _DetectorNetwork(backbone, neck, head, input_mean, input_std)
@@ -184,6 +189,12 @@ class YOLOXDetector(ModuleBaseModel):
                 f"input_channel_order must be bgr or rgb, got {input_channel_order!r}."
             )
         self.input_channel_order = input_channel_order
+        if export_input_channel_order not in (None, "bgr", "rgb"):
+            raise ValueError(
+                "export_input_channel_order must be bgr, rgb or None, got "
+                f"{export_input_channel_order!r}."
+            )
+        self.export_input_channel_order = export_input_channel_order or input_channel_order
         self.ema = (
             ModelEMA(self.network, decay=ema_decay, warmup_updates=ema_warmup_updates)
             if use_ema
@@ -349,8 +360,9 @@ class YOLOXDetector(ModuleBaseModel):
     def build_export_spec(self, multi_task_batch_inputs: ModelBatchInputs) -> ExportSpec:
         """Build the export specification of the detector.
 
-        The graph takes the image in the channel order of the backbone and returns one row
-        per prior: the raw box regression, the objectness and the class scores.
+        The graph takes the image in ``export_input_channel_order``, the order of the backbone
+        unless configured, and returns one row per prior: the raw box regression, the
+        objectness and the class scores.
 
         Args:
             multi_task_batch_inputs: Example preprocessed batch used for export.
@@ -358,9 +370,13 @@ class YOLOXDetector(ModuleBaseModel):
         Returns:
             Export specification of the end to end graph.
         """
+        flip_channels = self.export_input_channel_order != self.input_channel_order
+        images = self.prepare_images(multi_task_batch_inputs)
         return ExportSpec(
-            module=YOLOXExportModule(self.inference_network(), self.export_background_class),
-            args=(self.prepare_images(multi_task_batch_inputs),),
+            module=YOLOXExportModule(
+                self.inference_network(), self.export_background_class, flip_channels
+            ),
+            args=(images.flip(1) if flip_channels else images,),
             # The tensor names the YOLOX runtimes bind.
             input_names=["images"],
             output_names=["output"],
@@ -370,16 +386,21 @@ class YOLOXDetector(ModuleBaseModel):
 class YOLOXExportModule(nn.Module):
     """Deployed graph of the detector: image in, one row per prior out."""
 
-    def __init__(self, network: nn.Module, background_class: bool = False) -> None:
+    def __init__(
+        self, network: nn.Module, background_class: bool = False, flip_channels: bool = False
+    ) -> None:
         """Initialize the export wrapper.
 
         Args:
             network: Backbone, neck and head predicting the raw output map of every level.
             background_class: Whether to output a leading class score that is always zero.
+            flip_channels: Whether the graph reverses the channels of its input, for a
+              backbone reading the other channel order than the runtime delivers.
         """
         super().__init__()
         self.network = network
         self.background_class = background_class
+        self.flip_channels = flip_channels
         # The exporter restores the mode the module had before the export. A new module
         # starts in training mode, which would switch the wrapped network to training.
         self.train(network.training)
@@ -388,6 +409,8 @@ class YOLOXExportModule(nn.Module):
         self, images: Float[Tensor, "batch_size 3 height width"]
     ) -> Float[Tensor, "batch_size num_priors num_outputs"]:
         """Predict ``(dx, dy, log_w, log_h, objectness, class scores...)`` of every prior."""
+        if self.flip_channels:
+            images = images.flip(1)
         output = self.network.head.export_outputs(self.network(images))
         if not self.background_class:
             return output

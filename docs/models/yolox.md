@@ -132,6 +132,11 @@ left aligned, padded with 114, no normalization), decodes the boxes and suppress
 `model.export_background_class: true` adds a leading class score that is always zero, for a
 runtime whose label list starts with a background entry. The traffic light configs set it.
 
+The graph reads the channel order `model.export_input_channel_order` names, BGR by default,
+whatever order the backbone reads: for a backbone trained on RGB images the graph reverses
+the channels itself, and its normalization is part of the graph as well, so every backbone
+is deployed behind the same input. `null` exports the order of the backbone.
+
 An exported graph, or any ONNX file of the same contract, is scored on the test split with
 the pipeline, the decoding and the metric suite of a config:
 
