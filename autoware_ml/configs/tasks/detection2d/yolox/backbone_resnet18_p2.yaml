@@ -1,0 +1,14 @@
+# @package _global_
+# ResNet-18 of torchvision with a fourth, finer level: the backbone also returns its feature map at
+# stride 4, which the neck fuses and the head predicts from as a level of its own.
+defaults:
+  - backbone_resnet18
+  - _self_
+
+model:
+  backbone:
+    out_indices: [0, 1, 2, 3]
+  neck:
+    in_channels: [64, 128, 256, 512]
+  head:
+    strides: [4, 8, 16, 32]

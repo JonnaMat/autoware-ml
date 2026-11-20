@@ -24,12 +24,14 @@ exports it with the output layout the Autoware `tensorrt_yolox` runtime decodes.
 Experiment configs live under `autoware_ml/configs/tasks/detection2d/yolox/` and are passed to
 the CLI as the path relative to `tasks/`.
 
-| Config Name                                        | Backbone   | Purpose                                     |
-| -------------------------------------------------- | ---------- | ------------------------------------------- |
-| `detection2d/yolox/t4dataset/yolox_s_960x960_tlr`  | CSPDarknet | Whole-image traffic light detector, YOLOX-S |
-| `detection2d/yolox/t4dataset/resnet18_960x960_tlr` | ResNet-18  | The same detector with a ResNet-18 backbone |
+| Config Name                                           | Backbone   | Purpose                                      |
+| ----------------------------------------------------- | ---------- | -------------------------------------------- |
+| `detection2d/yolox/t4dataset/yolox_s_960x960_tlr`     | CSPDarknet | Whole-image traffic light detector, YOLOX-S  |
+| `detection2d/yolox/t4dataset/resnet18_960x960_tlr`    | ResNet-18  | The same detector with a ResNet-18 backbone  |
+| `detection2d/yolox/t4dataset/yolox_s_p2_960x960_tlr`  | CSPDarknet | YOLOX-S with a fourth level at stride 4      |
+| `detection2d/yolox/t4dataset/resnet18_p2_960x960_tlr` | ResNet-18  | ResNet-18 with a fourth level at stride 4    |
 
-Both detect two classes, `traffic_light` and `pedestrian_traffic_light`, at 960x960. They read
+All detect two classes, `traffic_light` and `pedestrian_traffic_light`, at 960x960. They read
 the scenario lists `db_tlr_v1.yaml` to `db_tlr_v7.yaml` below `t4dataset/detection2d/` of
 `AUTOWARE_ML_SCENARIOS_PATH` and the scenes below `t4dataset/` of `AUTOWARE_ML_DATA_PATH`, see
 [Configuration](../user-guide/configuration.md#external-configs-and-scenario-lists). The lists
@@ -43,11 +45,21 @@ The config tree separates what two detectors share from what tells them apart:
 | `base.yaml`                       | Detector, neck, head, optimizer, schedule, averaged weights, export |
 | `backbone_csp_darknet_s.yaml`     | CSPDarknet of YOLOX-S and its input convention                      |
 | `backbone_resnet18.yaml`          | ResNet-18 of torchvision and its input normalization                |
+| `backbone_*_p2.yaml`              | The same backbones with a fourth level at stride 4                  |
 | `t4dataset/base_960x960.yaml`     | Input size, training and test pipelines, metric suites              |
 | `t4dataset/base_960x960_tlr.yaml` | Traffic light database, taxonomy and validation schedule            |
 
 A backbone returns its feature maps at strides 8, 16 and 32 and the block tells the neck their
 channels, so a leaf with another backbone composes another block and keeps everything else.
+
+The `backbone_*_p2` blocks add a level at stride 4 for small objects: the backbone returns its
+stride 4 feature map too (`out_indices: [0, 1, 2, 3]`), the neck fuses four levels (`in_channels:
+[64, 128, 256, 512]`) and the head predicts at `strides: [4, 8, 16, 32]`. The three coarser levels
+keep their modules, so a three-level checkpoint initializes them; the levels of the head are counted
+from the finest, so `convert_weights --head-level-offset 1` writes the weights of a three-level head
+one level up, where the four-level head reads them. A 960x960 input then has 76 500 priors (240² +
+120² + 60² + 30²) instead of 18 900, and the deployed graph outputs one row for each, the stride 4
+rows first: a runtime decoding the output needs the four strides.
 
 ## Training
 
