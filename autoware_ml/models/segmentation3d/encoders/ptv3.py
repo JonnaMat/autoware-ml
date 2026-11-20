@@ -1489,6 +1489,7 @@ class LitePTEncoder(PointTransformerV3Encoder):
         enc_attn: Sequence[bool] = (False, False, False, True, True),
         enc_rope_base: Sequence[float | None] | float | None = 100.0,
         qk_norm: bool = False,
+        enc_head_dim: Sequence[int | None] | int | None = None,
     ) -> None:
         """Initialize the LitePT encoder.
 
@@ -1525,6 +1526,10 @@ class LitePTEncoder(PointTransformerV3Encoder):
                 keys per head. Off in the published parametrization; the T4
                 recipes turn it on because the conv-less blocks otherwise grow
                 their attention logits until the run diverges.
+            enc_head_dim: Per-head attention width per stage, see
+                :class:`PointTransformerV3Encoder`. ``None`` keeps
+                ``channels // num_heads``; a head-pruned checkpoint keeps the
+                trained width with fewer heads.
         """
         super().__init__(
             in_channels=in_channels,
@@ -1552,6 +1557,7 @@ class LitePTEncoder(PointTransformerV3Encoder):
             enc_attn=enc_attn,
             enc_rope_base=enc_rope_base,
             qk_norm=qk_norm,
+            enc_head_dim=enc_head_dim,
         )
 
 
