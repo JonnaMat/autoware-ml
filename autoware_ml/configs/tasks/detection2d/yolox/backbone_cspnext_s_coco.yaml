@@ -1,0 +1,15 @@
+# @package _global_
+# CSPNeXt-S with the input convention of the RTMDet-S detector trained on COCO, whose backbone
+# reads BGR normalized by the ImageNet statistics in that order.
+defaults:
+  - backbone_cspnext_s
+  - _self_
+
+model:
+  input_channel_order: bgr
+  input_mean: [103.53, 116.28, 123.675]
+  input_std: [57.375, 57.12, 58.395]
+
+  backbone:
+    # Set to rtmdet_s_coco_300e to start from the backbone of the COCO detector of MMDetection.
+    weights: null
