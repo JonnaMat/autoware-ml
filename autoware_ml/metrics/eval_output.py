@@ -35,6 +35,7 @@ from jaxtyping import Float, Float32, Int, Int64
 from pydantic import BaseModel, ConfigDict, InstanceOf, model_validator
 
 from autoware_ml.dataclasses.batch.frame_meta import FrameMetaSample
+from autoware_ml.dataclasses.models.detection2d.predictions import Detection2DSamplePredictions
 from autoware_ml.dataclasses.models.detection3d.predictions import Detection3DSamplePredictions
 
 MIN_BOX_PARAMS = 7
@@ -189,6 +190,50 @@ class Segmentation3DEvalOutput(BaseModel):
         return all(frame.gt_boxes is not None for frame in self.frames)
 
 
+class Detection2DEvalFrame(BaseModel):
+    """One image of 2D detection: its detections and its ground truth boxes.
+
+    Both are in pixels of the original image, before any resizing of the test pipeline, so
+    the size of a box is the size the annotation gives it.
+
+    Attributes:
+        predictions: Detections of the image.
+        gt_boxes: Ground truth boxes ``(x_min, y_min, x_max, y_max)``.
+        gt_labels: Class index of every ground truth box.
+        is_padding: Whether the image only pads a streaming lane and is left out of the
+            metrics.
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True, arbitrary_types_allowed=True)
+
+    predictions: Detection2DSamplePredictions
+    gt_boxes: Float32[torch.Tensor, "num_gt_boxes 4"]
+    gt_labels: Int64[torch.Tensor, " num_gt_boxes"]
+    is_padding: bool = False
+
+    @model_validator(mode="after")
+    def _check_ground_truth(self) -> Detection2DEvalFrame:
+        """Check that the boxes and the labels describe the same boxes."""
+        if self.gt_labels.shape[0] != self.gt_boxes.shape[0]:
+            raise ValueError(
+                f"gt_labels describe {self.gt_labels.shape[0]} boxes, gt_boxes "
+                f"{self.gt_boxes.shape[0]}."
+            )
+        return self
+
+
+class Detection2DEvalOutput(BaseModel):
+    """The 2D detection part of an eval output: one frame per image of the batch.
+
+    Attributes:
+        frames: Detections and ground truth of every image, in batch order.
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    frames: Sequence[Detection2DEvalFrame]
+
+
 class EvalOutput(BaseModel):
     """
     What a model hands its metric suites for one batch.
@@ -196,12 +241,14 @@ class EvalOutput(BaseModel):
     Attributes:
       detection3d: The detection frames, when the model detects.
       segmentation3d: The segmentation frames, when the model segments.
+      detection2d: The 2D detection frames, when the model detects in the image.
     """
 
     model_config = ConfigDict(frozen=True, strict=True)
 
     detection3d: Detection3DEvalOutput | None = None
     segmentation3d: Segmentation3DEvalOutput | None = None
+    detection2d: Detection2DEvalOutput | None = None
 
 
 class MetricRequirements(BaseModel):
@@ -211,6 +258,7 @@ class MetricRequirements(BaseModel):
     Attributes:
       detection3d: The suite reads the detection frames.
       segmentation3d: The suite reads the segmentation frames.
+      detection2d: The suite reads the 2D detection frames.
       frame_meta: A filter or a collision provider reads the pose and lanelet map of the frames.
       gt_num_points: A ground truth point filter reads the lidar point count of every box.
       scores: A point metric reads the per-class scores of the points.
@@ -221,6 +269,7 @@ class MetricRequirements(BaseModel):
 
     detection3d: bool = False
     segmentation3d: bool = False
+    detection2d: bool = False
     frame_meta: bool = False
     gt_num_points: bool = False
     scores: bool = False
@@ -243,6 +292,8 @@ class MetricRequirements(BaseModel):
             missing.append("detection3d frames")
         if self.segmentation3d and segmentation is None:
             missing.append("segmentation3d frames")
+        if self.detection2d and eval_output.detection2d is None:
+            missing.append("detection2d frames")
         # The metadata counts as present when every part the output holds carries it.
         has_frame_meta = (
             (detection is not None or segmentation is not None)
