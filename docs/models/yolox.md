@@ -24,12 +24,15 @@ exports it with the output layout the Autoware `tensorrt_yolox` runtime decodes.
 Experiment configs live under `autoware_ml/configs/tasks/detection2d/yolox/` and are passed to
 the CLI as the path relative to `tasks/`.
 
-| Config Name                                        | Backbone   | Purpose                                     |
-| -------------------------------------------------- | ---------- | ------------------------------------------- |
-| `detection2d/yolox/t4dataset/yolox_s_960x960_tlr`  | CSPDarknet | Whole-image traffic light detector, YOLOX-S |
-| `detection2d/yolox/t4dataset/resnet18_960x960_tlr` | ResNet-18  | The same detector with a ResNet-18 backbone |
+| Config Name                                                 | Backbone   | Purpose                                              |
+| ----------------------------------------------------------- | ---------- | ---------------------------------------------------- |
+| `detection2d/yolox/t4dataset/yolox_s_960x960_tlr`           | CSPDarknet | Whole-image traffic light detector, YOLOX-S          |
+| `detection2d/yolox/t4dataset/resnet18_960x960_tlr`          | ResNet-18  | The same detector with a ResNet-18 backbone          |
+| `detection2d/yolox/t4dataset/hgnetv2_b0_960x960_tlr`        | HGNetV2-B0 | The same detector with an HGNetV2-B0 backbone        |
+| `detection2d/yolox/t4dataset/hgnetv2_b1_960x960_tlr`        | HGNetV2-B1 | The same detector with an HGNetV2-B1 backbone        |
+| `detection2d/yolox/t4dataset/hgnetv2_b0_native_960x960_tlr` | HGNetV2-B0 | HGNetV2-B0 with a neck of the widths of its backbone |
 
-Both detect two classes, `traffic_light` and `pedestrian_traffic_light`, at 960x960. They read
+All detect two classes, `traffic_light` and `pedestrian_traffic_light`, at 960x960. They read
 the scenario lists `db_tlr_v1.yaml` to `db_tlr_v7.yaml` below `t4dataset/detection2d/` of
 `AUTOWARE_ML_SCENARIOS_PATH` and the scenes below `t4dataset/` of `AUTOWARE_ML_DATA_PATH`, see
 [Configuration](../user-guide/configuration.md#external-configs-and-scenario-lists). The lists
@@ -43,11 +46,19 @@ The config tree separates what two detectors share from what tells them apart:
 | `base.yaml`                       | Detector, neck, head, optimizer, schedule, averaged weights, export |
 | `backbone_csp_darknet_s.yaml`     | CSPDarknet of YOLOX-S and its input convention                      |
 | `backbone_resnet18.yaml`          | ResNet-18 of torchvision and its input normalization                |
+| `backbone_hgnetv2_*.yaml`         | HGNetV2 of timm, its input normalization and its projections        |
 | `t4dataset/base_960x960.yaml`     | Input size, training and test pipelines, metric suites              |
 | `t4dataset/base_960x960_tlr.yaml` | Traffic light database, taxonomy and validation schedule            |
 
 A backbone returns its feature maps at strides 8, 16 and 32 and the block tells the neck their
 channels, so a leaf with another backbone composes another block and keeps everything else.
+
+The stages of HGNetV2 are twice as wide as those of YOLOX-S (256, 512 and 1024 channels). The
+`hgnetv2_b0` and `hgnetv2_b1` blocks add a 1x1 convolution block per level that projects them to
+128, 256 and 512 channels, so the neck and the head are those of the other backbones. The
+`hgnetv2_b0_native` block passes the stage outputs on and widens the neck instead. The ImageNet
+weights of timm (Apache-2.0) are downloaded into the torch hub cache with
+`model.backbone.weights=ssld_stage2_ft_in1k`; the path of a timm state dict file works too.
 
 ## Training
 
@@ -195,6 +206,7 @@ the image resized to fit the network input:
 | `autoware_ml/models/detection2d/heads/yolox.py`         | Head, losses and decoding                          |
 | `autoware_ml/models/detection2d/task_modules/simota.py` | SimOTA label assignment                            |
 | `autoware_ml/models/common/backbones/csp_darknet.py`    | CSPDarknet backbone                                |
+| `autoware_ml/models/common/backbones/hgnetv2.py`        | HGNetV2 backbone                                   |
 | `autoware_ml/models/common/necks/yolox_pafpn.py`        | PAFPN neck                                         |
 | `autoware_ml/models/common/ema.py`                      | Exponential moving average of the weights          |
 | `autoware_ml/models/detection2d/yolox_weights.py`       | Conversion of reference checkpoints and ONNX files |

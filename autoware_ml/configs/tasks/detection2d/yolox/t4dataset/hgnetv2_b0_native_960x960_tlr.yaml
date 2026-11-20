@@ -1,0 +1,8 @@
+# @package _global_
+# Whole-image traffic light detector with an HGNetV2-B0 backbone and a neck of its widths.
+defaults:
+  - base_960x960_tlr
+  - ../backbone_hgnetv2_b0_native
+  - _self_
+
+experiment_name: hgnetv2_b0_native_960x960_tlr

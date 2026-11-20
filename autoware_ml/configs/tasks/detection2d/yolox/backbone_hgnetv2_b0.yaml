@@ -1,0 +1,21 @@
+# @package _global_
+# HGNetV2-B0 of timm. Its ImageNet weights read RGB normalized by the ImageNet statistics,
+# which the detector applies inside the network: the deployed graph still takes raw pixels.
+# The stages output 256, 512 and 1024 channels at strides 8, 16 and 32. A 1x1 convolution block
+# per level projects them to the widths of YOLOX-S, so the neck and the head stay those of the
+# other backbones.
+model:
+  input_channel_order: rgb
+  input_mean: [123.675, 116.28, 103.53]
+  input_std: [58.395, 57.12, 57.375]
+
+  backbone:
+    _target_: autoware_ml.models.common.backbones.hgnetv2.HGNetV2
+    variant: b0
+    in_channels: 3
+    out_indices: [1, 2, 3]
+    projection_channels: [128, 256, 512]
+    # Set to ssld_stage2_ft_in1k to start from the ImageNet weights of timm.
+    weights: null
+  neck:
+    in_channels: [128, 256, 512]
