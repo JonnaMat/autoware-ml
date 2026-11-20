@@ -1,0 +1,21 @@
+# @package _global_
+# Optimizer of the leaves with a pretrained transformer backbone: AdamW in place of the SGD of the YOLOX recipe, with
+# the pretrained backbone at its own learning rates. The schedule, the warmup and the groups
+# without weight decay stay those of base.yaml.
+base_lr_per_image: 3.125e-6
+
+# The optimizer block of base.yaml carries the arguments of SGD, so AdamW is a block of its own.
+adamw_optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: ${multiply:${base_lr_per_image},${global_batch_size}}
+  weight_decay: 0.05
+
+model:
+  _target_: autoware_ml.models.detection2d.yolox_layer_decay.YOLOXLayerDecayDetector
+  optimizer: ${adamw_optimizer}
+  # Learning rate of the last backbone layer as a share of the rate of the optimizer.
+  backbone_lr_factor: 1.0
+  # Factor between the rates of two consecutive backbone layers, 1.0 for one rate. Read by
+  # backbones that tell their layers, the plain vision transformers.
+  layer_decay: 0.8

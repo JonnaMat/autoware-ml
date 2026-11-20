@@ -1,0 +1,19 @@
+# @package _global_
+# PVT v2 B1 of timm, a hierarchical transformer with spatial reduction attention. Its ImageNet
+# weights read RGB normalized by the ImageNet statistics, which the detector applies inside
+# the network: the deployed graph still takes raw pixels.
+model:
+  input_channel_order: rgb
+  input_mean: [123.675, 116.28, 103.53]
+  input_std: [58.395, 57.12, 57.375]
+
+  backbone:
+    _target_: autoware_ml.models.common.backbones.pvt_v2.PVTv2
+    model_name: pvt_v2_b1.in1k
+    # Set to true to start a training from the weights of timm, which downloads them. A run
+    # that loads a detector checkpoint needs none.
+    pretrained: false
+    out_indices: [1, 2, 3]
+    drop_path_rate: 0.0
+  neck:
+    in_channels: [128, 320, 512]
