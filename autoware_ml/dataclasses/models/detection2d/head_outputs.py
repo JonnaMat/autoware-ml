@@ -79,3 +79,38 @@ class FocalHead2DOutputs(BaseModel):
                 f"grid is {self.feature_height} x {self.feature_width}."
             )
         return self
+
+
+class YOLOXHeadOutputs(BaseModel):
+    """
+    Dataclass to save the raw dense outputs of a YOLOX head.
+
+    Every image gets one prediction per prior, the priors of the feature levels concatenated
+    from the finest level to the coarsest and flattened row by row.
+
+    Attributes:
+      predictions: Raw outputs of every prior: the box regression ``(dx, dy, log_w, log_h)`` in
+        units of the stride of the prior, the objectness logit, then one logit per class.
+      priors: ``(grid_x, grid_y, stride)`` of every prior, the grid position being the column
+        and the row of the prior on its feature level.
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True, arbitrary_types_allowed=True)
+
+    predictions: Float32[torch.Tensor, "batch_size num_priors num_outputs"]
+    priors: Float32[torch.Tensor, "num_priors 3"]
+
+    @model_validator(mode="after")
+    def _check_priors(self) -> YOLOXHeadOutputs:
+        """Check that the predictions cover the priors and carry at least one class."""
+        if self.predictions.shape[1] != self.priors.shape[0]:
+            raise ValueError(
+                f"predictions cover {self.predictions.shape[1]} priors, priors hold "
+                f"{self.priors.shape[0]}."
+            )
+        if self.predictions.shape[2] < 6:
+            raise ValueError(
+                "predictions need 4 box values, 1 objectness and at least 1 class logit per "
+                f"prior, got {self.predictions.shape[2]} values."
+            )
+        return self

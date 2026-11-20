@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict
 from autoware_ml.dataclasses.models.calibration_status.predictions import (
     CalibrationStatusPredictions,
 )
+from autoware_ml.dataclasses.models.detection2d.predictions import Detection2DSamplePredictions
 from autoware_ml.dataclasses.models.detection3d.predictions import Detection3DSamplePredictions
 from autoware_ml.dataclasses.models.segmentation3d.predictions import Segmentation3DPredictions
 
@@ -39,6 +40,7 @@ class ModelPredictions(BaseModel):
       detection3d_predictions: Decoded predictions from a 3D detection task.
       segmentation3d_predictions: Decoded predictions from a 3D segmentation task.
       calibration_status_predictions: Decoded predictions from a calibration status task.
+      detection2d_predictions: Decoded predictions from a 2D detection task, one per image.
     """
 
     model_config = ConfigDict(frozen=True, strict=True, arbitrary_types_allowed=True)
@@ -47,3 +49,4 @@ class ModelPredictions(BaseModel):
     detection3d_predictions: Sequence[Detection3DSamplePredictions] | None = None
     segmentation3d_predictions: Segmentation3DPredictions | None = None
     calibration_status_predictions: CalibrationStatusPredictions | None = None
+    detection2d_predictions: Sequence[Detection2DSamplePredictions] | None = None
