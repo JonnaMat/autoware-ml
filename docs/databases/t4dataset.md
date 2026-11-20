@@ -11,7 +11,7 @@ This module implements the database layer for the **T4** annotation format, buil
 | Property     | Value                                                       |
 | ------------ | ----------------------------------------------------------- |
 | Format       | JSON (T4 annotation tables via `t4-devkit`)                 |
-| Annotations  | 3D bounding boxes                                           |
+| Annotations  | 3D bounding boxes, 2D bounding boxes of camera images       |
 | Modality     | Multiple LiDAR (+ cameras in source data, not yet exported) |
 | Dependencies | `t4-devkit`, `polars`, `numpy`                              |
 | Input        | Scenario YAML files and T4 annotation directories           |
@@ -112,6 +112,18 @@ classDiagram
     schemas --> polars : DataFrame with DatasetTableSchema
 ```
 
+## Camera images with 2D boxes
+
+`T4Dataset2D` (`t4dataset_2d.py`) is a second database over T4 scenes, for scenes annotated in 2D. Such a scene carries its boxes in `annotation/object_ann.json`, one entry per box of one camera image, and may hold no LiDAR frame at all. The database reads the annotation tables as plain JSON and writes one record per camera key frame: the image as the single image frame of the record, no LiDAR frame, and its boxes in the `boxes_2d` column. A key frame without a box is served with an empty box list.
+
+| Setting           | Meaning                                                                        |
+| ----------------- | ------------------------------------------------------------------------------ |
+| `vocabulary`      | Maps every annotation category onto a fine label name, or null to leave it out |
+| `camera_channels` | Camera channels whose images are served, every camera of a scene by default    |
+| `keyframes_only`  | Whether only key frames are served, the frames a 2D annotation covers          |
+
+A category the vocabulary does not list stops the record generation and is named in the error. The scenario lists are those of `T4Scenarios`; an entry may separate the scene and its version by whitespace, `<scene>   <version>`, as well as by a slash. `autoware_ml/configs/database/t4dataset/t4dataset_2d_common.yaml` is the base config of such a database and `t4dataset_tlr.yaml` the traffic light database built on it.
+
 ## Output table schema
 
 `T4Dataset.process_scenario_records()` produces a list of `DatasetRecord` objects and persists them as a Polars `DataFrame` written to Parquet. For the complete table layout and nested struct definitions, see [Dataset Schema](schemas.md).
@@ -126,6 +138,7 @@ Each row corresponds to one `DatasetRecord` (a frozen Pydantic model). The Parqu
 | `autoware_ml/databases/t4dataset/t4records_generator.py` | T4 annotation reading and per-sample extraction                  |
 | `autoware_ml/databases/t4dataset/t4sample_records.py`    | Intermediate `T4SampleRecord` to unified dataset row conversion  |
 | `autoware_ml/databases/t4dataset/t4dataset.py`           | T4 database orchestration with parallel processing               |
+| `autoware_ml/databases/t4dataset/t4dataset_2d.py`        | T4 database of camera images with 2D boxes                       |
 
 ## Acknowledgment
 

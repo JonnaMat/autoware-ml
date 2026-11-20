@@ -40,6 +40,7 @@ nav = [
     { "TransFusion" = "models/transfusion.md" },
     { "BEVFusion" = "models/bevfusion.md" },
     { "StreamPETR" = "models/streampetr.md" },
+    { "YOLOX" = "models/yolox.md" },
     { "FRNet" = "models/frnet.md" },
     { "PointTransformerV3" = "models/ptv3.md" },
     { "LitePT" = "models/litept.md" },

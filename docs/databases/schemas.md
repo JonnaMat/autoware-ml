@@ -36,6 +36,8 @@ class DatasetTableSchema:
     BOXES_3D = DatasetTableColumn("boxes_3d", pl.List(pl.Struct(...)))
     # Motion forecasting
     MOTION = DatasetTableColumn("motion", pl.Struct(...))
+    # 2D annotation fields
+    BOXES_2D = DatasetTableColumn("boxes_2d", pl.List(pl.Struct(...)))
 
     @classmethod
     def to_polars_schema(cls) -> pl.Schema: ...
@@ -53,6 +55,7 @@ class DatasetRecord(BaseModel, DataModelInterface):
     category_mapping: CategoryMappingDataModel | None
     boxes_3d: Sequence[Box3DDataModel] | None
     motion: MotionDataModel | None = None
+    boxes_2d: Sequence[Box2DDataModel] | None = None
 
     def to_dictionary(self) -> Mapping[str, Any]: ...
     @classmethod
@@ -135,6 +138,7 @@ Each list entry is a `LidarSourceDataModel` describing one LiDAR sensor in the s
 | `category_mapping.py`     | `CategoryMappingDatasetSchema` | `CategoryMappingDataModel` | Parallel lists of category names and indices            |
 | `motion.py`               | `MotionDatasetSchema`          | `MotionDataModel`          | Source and time window of a forecasting scenario        |
 | `box3d_schemas.py`        | `Box3DDatasetSchema`           | `Box3DDataModel`           | Per-object 3D box parameters and metadata               |
+| `box2d_schemas.py`        | `Box2DDatasetSchema`           | `Box2DDataModel`           | Per-object 2D box of a camera image and its metadata    |
 | `frame_basic_metadata.py` | —                              | `FrameBasicMetadata`       | Shared per-frame metadata used during record generation |
 
 ### `boxes_3d` struct fields
@@ -152,6 +156,19 @@ Each list entry is a `Box3DDataModel` with the following struct fields:
 | `box3d_valid`                 | `Boolean`               | Validity flag for this annotation                                                |
 | `box3d_attributes`            | `List(String)`          | Attribute tags associated with this box                                          |
 | `box3d_coordinate`            | `String`                | Coordinate frame identifier for the box representation                           |
+
+### `boxes_2d` struct fields
+
+Each list entry is a `Box2DDataModel`, a box annotated in one of the image frames of the record. The column is null for the records of a database without 2D box annotations, and an empty list for an annotated image without a box.
+
+| Field                      | Polars type         | Description                                                      |
+| -------------------------- | ------------------- | ---------------------------------------------------------------- |
+| `box2d_params`             | `Array(Float32, 4)` | Box `(x_min, y_min, x_max, y_max)` in pixels of the raw image    |
+| `box2d_instance_id`        | `String`            | Instance identifier for the box                                  |
+| `box2d_dataset_label_name` | `String`            | Original dataset label name                                      |
+| `box2d_label_name`         | `String`            | Fine label name, null for a dataset label outside every taxonomy |
+| `box2d_attributes`         | `List(String)`      | Attribute tags associated with this box                          |
+| `box2d_image_frame_id`     | `String`            | `image_frame_id` of the image frame the box is annotated in      |
 
 ### `motion` struct fields
 
@@ -193,5 +210,6 @@ See [T4Dataset](t4dataset.md) for a concrete example of how these schemas are po
 | `autoware_ml/databases/schemas/lidar_sources.py`        | LiDAR source struct schema and data model                     |
 | `autoware_ml/databases/schemas/category_mapping.py`     | Category mapping struct schema and data model                 |
 | `autoware_ml/databases/schemas/box3d_schemas.py`        | 3D box struct schema and data model                           |
+| `autoware_ml/databases/schemas/box2d_schemas.py`        | 2D box struct schema and data model                           |
 | `autoware_ml/databases/schemas/motion.py`               | Motion struct schema and data model                           |
 | `autoware_ml/databases/schemas/frame_basic_metadata.py` | Shared per-frame metadata model                               |
