@@ -27,7 +27,9 @@ the CLI as the path relative to `tasks/`.
 | Config Name                                                   | Backbone     | Purpose                                                                           |
 | ------------------------------------------------------------- | ------------ | --------------------------------------------------------------------------------- |
 | `detection2d/yolox/t4dataset/yolox_s_960x960_tlr`             | CSPDarknet   | Whole-image traffic light detector, YOLOX-S                                       |
+| `detection2d/yolox/t4dataset/yolox_m_960x960_tlr`             | CSPDarknet   | The same detector with the backbone, the neck and the head of YOLOX-M             |
 | `detection2d/yolox/t4dataset/resnet18_960x960_tlr`            | ResNet-18    | The same detector with a ResNet-18 backbone                                       |
+| `detection2d/yolox/t4dataset/resnet50_native_960x960_tlr`     | ResNet-50    | ResNet-50 with a neck of the widths of its backbone                               |
 | `detection2d/yolox/t4dataset/hgnetv2_b0_960x960_tlr`          | HGNetV2-B0   | The same detector with an HGNetV2-B0 backbone                                     |
 | `detection2d/yolox/t4dataset/hgnetv2_b1_960x960_tlr`          | HGNetV2-B1   | The same detector with an HGNetV2-B1 backbone                                     |
 | `detection2d/yolox/t4dataset/hgnetv2_b0_native_960x960_tlr`   | HGNetV2-B0   | HGNetV2-B0 with a neck of the widths of its backbone                              |
@@ -52,7 +54,9 @@ The config tree separates what two detectors share from what tells them apart:
 | --------------------------------- | ------------------------------------------------------------------- |
 | `base.yaml`                       | Detector, neck, head, optimizer, schedule, averaged weights, export |
 | `backbone_csp_darknet_s.yaml`     | CSPDarknet of YOLOX-S and its input convention                      |
+| `backbone_csp_darknet_m.yaml`     | CSPDarknet, neck depth and head width of YOLOX-M                    |
 | `backbone_resnet18.yaml`          | ResNet-18 of torchvision and its input normalization                |
+| `backbone_resnet50_native.yaml`   | ResNet-50 of torchvision, its input normalization and neck widths   |
 | `backbone_hgnetv2_*.yaml`         | HGNetV2 of timm, its input normalization and its projections        |
 | `backbone_cspnext_s*.yaml`        | CSPNeXt-S of RTMDet and the input convention of its weights         |
 | `backbone_*_p2.yaml`              | The same backbones with a fourth level at stride 4                  |
@@ -64,6 +68,20 @@ The config tree separates what two detectors share from what tells them apart:
 
 A backbone returns its feature maps at strides 8, 16 and 32 and the block tells the neck their
 channels, so a leaf with another backbone composes another block and keeps everything else.
+
+The `backbone_csp_darknet_m` block is the one block that also changes the neck and the head: it
+sets the depth 0.67 and the width 0.75 of YOLOX-M in the backbone (192, 384 and 768 channels),
+the same depth in the neck (`model.neck.deepen_factor`) and 192 channels in the head
+(`model.head.feat_channels`). The detector then has the shapes of the YOLOX-M checkpoint of the
+reference implementation, which `convert_weights` converts like the one of YOLOX-S, as a whole
+or by its parts.
+
+The stages of ResNet-50 are four times as wide as those of ResNet-18 (512, 1024 and 2048
+channels). The neck keeps the width of its inputs, so the `backbone_resnet50_native` block makes
+it four times as wide as that of YOLOX-S, wider than the neck of any YOLOX model; the head keeps
+its 128 channels. The ImageNet weights of torchvision are downloaded into the torch hub cache with
+`model.backbone.weights=IMAGENET1K_V2` or `model.backbone.weights=IMAGENET1K_V1`. No converted
+YOLOX checkpoint fits the neck of this leaf.
 
 The stages of HGNetV2 are twice as wide as those of YOLOX-S (256, 512 and 1024 channels). The
 `hgnetv2_b0` and `hgnetv2_b1` blocks add a 1x1 convolution block per level that projects them to
@@ -116,6 +134,16 @@ python -m autoware_ml.scripts.tools.yolox.convert_weights yolox_s.pth yolox_s_co
 autoware-ml train \
     --config-name detection2d/yolox/t4dataset/yolox_s_960x960_tlr \
     --weights yolox_s_coco.ckpt --skip-mismatched-weights
+```
+
+The YOLOX-M leaf starts from the YOLOX-M checkpoint in the same way:
+
+```bash
+python -m autoware_ml.scripts.tools.yolox.convert_weights yolox_m.pth yolox_m_coco.ckpt
+
+autoware-ml train \
+    --config-name detection2d/yolox/t4dataset/yolox_m_960x960_tlr \
+    --weights yolox_m_coco.ckpt --skip-mismatched-weights
 ```
 
 `convert_weights --parts` keeps a part of the weights only. `--parts backbone` writes a
