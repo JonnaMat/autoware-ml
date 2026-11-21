@@ -24,7 +24,7 @@ import unittest
 import torch
 
 from autoware_ml.models.common.backbones.csp_darknet import CSPDarknet
-from autoware_ml.models.common.backbones.resnet import ResNet18MultiScale
+from autoware_ml.models.common.backbones.resnet import ResNet18MultiScale, ResNet50MultiScale
 from autoware_ml.models.common.necks.yolox_pafpn import YOLOXPAFPN
 from autoware_ml.models.detection2d.heads.yolox import YOLOXHead
 from autoware_ml.models.detection2d.tests.yolox_fixtures import build_detector
@@ -297,6 +297,48 @@ class TestReferenceCheckpoint(unittest.TestCase):
             torch.testing.assert_close(value, initial_backbone[name])
         for name, value in source.network.neck.state_dict().items():
             torch.testing.assert_close(target.network.neck.state_dict()[name], value)
+
+    def test_neck_and_head_weights_load_below_a_projected_backbone(self) -> None:
+        """Test the neck and head parts of a deeper checkpoint below a projected ResNet-50.
+
+        Setup: a source detector of depth 0.67, and a ResNet-50 whose stages are projected to
+        the widths of the source backbone, under a neck and a head of the source shapes.
+        Check: every neck and head tensor loads, nothing is skipped or unexpected, and the
+        backbone with its projections is untouched.
+        """
+        source_backbone = CSPDarknet(deepen_factor=0.67, widen_factor=0.125)
+        widths = source_backbone.out_channels
+
+        def build(backbone: torch.nn.Module) -> YOLOXDetector:
+            return YOLOXDetector(
+                backbone=backbone,
+                neck=YOLOXPAFPN(in_channels=widths, deepen_factor=0.67),
+                head=YOLOXHead(num_classes=2, in_channels=widths, feat_channels=24),
+                log_dict_configs=LogDictConfigs(prog_bar=False),
+                data_preprocessor=DataPreprocessor(preprocessor_modules=[]),
+            )
+
+        source = build(source_backbone)
+        backbone = ResNet50MultiScale(in_channels=3, projection_channels=widths)
+        target = build(backbone)
+        initial_backbone = {name: value.clone() for name, value in backbone.state_dict().items()}
+        with tempfile.TemporaryDirectory() as directory:
+            reference_path = Path(directory) / "reference.pth"
+            converted_path = Path(directory) / "neck_head.ckpt"
+            torch.save({"model": _reference_state_dict(source)}, reference_path)
+            convert(reference_path, converted_path, parts=["neck", "head"])
+
+            (report,) = apply_matching_weights(target, converted_path, skip_mismatched_shapes=True)
+
+        self.assertEqual(report.unexpected_keys, ())
+        self.assertEqual(report.shape_mismatched_keys, ())
+        self.assertTrue(all(".backbone." not in key for key in report.loaded_keys))
+        self.assertTrue(any(name.startswith("projections.") for name in initial_backbone))
+        for name, value in backbone.state_dict().items():
+            torch.testing.assert_close(value, initial_backbone[name])
+        for part in ("neck", "head"):
+            for name, value in getattr(source.network, part).state_dict().items():
+                torch.testing.assert_close(getattr(target.network, part).state_dict()[name], value)
 
     def test_unknown_or_missing_parts_are_refused(self) -> None:
         """Test that the parts to keep must be some of backbone, neck and head."""

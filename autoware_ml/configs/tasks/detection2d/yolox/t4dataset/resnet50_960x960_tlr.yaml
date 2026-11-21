@@ -1,0 +1,8 @@
+# @package _global_
+# Whole-image traffic light detector with a ResNet-50 backbone under the YOLOX-M neck and head.
+defaults:
+  - base_960x960_tlr
+  - ../backbone_resnet50
+  - _self_
+
+experiment_name: resnet50_960x960_tlr
