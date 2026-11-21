@@ -51,6 +51,26 @@ class TestCSPDarknet(unittest.TestCase):
 
         self.assertEqual(num_parameters, 4_212_672)
 
+    def test_medium_variant_returns_strides_8_16_32(self) -> None:
+        """Test that the YOLOX-M factors give 192, 384 and 768 channels at strides 8, 16, 32."""
+        backbone = CSPDarknet(deepen_factor=0.67, widen_factor=0.75).eval()
+
+        with torch.no_grad():
+            features = backbone(self.images)
+
+        self.assertEqual(backbone.out_channels, (192, 384, 768))
+        self.assertEqual(
+            [tuple(f.shape) for f in features], [(2, 192, 16, 16), (2, 384, 8, 8), (2, 768, 4, 4)]
+        )
+
+    def test_medium_variant_has_the_parameter_count_of_the_reference(self) -> None:
+        """Test that the YOLOX-M backbone holds the 12.35 M parameters of the reference backbone."""
+        backbone = CSPDarknet(deepen_factor=0.67, widen_factor=0.75)
+
+        num_parameters = sum(parameter.numel() for parameter in backbone.parameters())
+
+        self.assertEqual(num_parameters, 12_352_992)
+
     def test_widen_factor_scales_the_channels(self) -> None:
         """Test that the widen factor scales the channels of every returned level."""
         backbone = CSPDarknet(

@@ -110,6 +110,44 @@ class TestReferenceCheckpoint(unittest.TestCase):
             torch.testing.assert_close(target.network.state_dict()[name], value)
             torch.testing.assert_close(target.ema.module.state_dict()[name], value)
 
+    def test_converted_checkpoint_covers_a_deeper_detector(self) -> None:
+        """Test that a checkpoint of the depth of YOLOX-M converts like one of YOLOX-S.
+
+        Setup: detectors with the depth factor 0.67 in the backbone and the neck, which
+        doubles the bottlenecks of every CSP layer, at a narrow width.
+        Check: the converted checkpoint loads strictly, its parts cover the detector, and
+        the weights hold the source weights.
+        """
+
+        def build_deeper_detector() -> YOLOXDetector:
+            backbone = CSPDarknet(deepen_factor=0.67, widen_factor=0.125)
+            return YOLOXDetector(
+                backbone=backbone,
+                neck=YOLOXPAFPN(in_channels=backbone.out_channels, deepen_factor=0.67),
+                head=YOLOXHead(num_classes=2, in_channels=backbone.out_channels, feat_channels=24),
+                log_dict_configs=LogDictConfigs(prog_bar=False),
+                data_preprocessor=DataPreprocessor(preprocessor_modules=[]),
+            )
+
+        torch.manual_seed(0)
+        source = build_deeper_detector()
+        target = build_deeper_detector()
+
+        state_dict = convert_reference_checkpoint({"model": _reference_state_dict(source)})
+        target.load_state_dict(state_dict, strict=True)
+
+        self.assertGreater(
+            len(source.network.state_dict()), len(build_detector().network.state_dict())
+        )
+        for name, value in source.network.state_dict().items():
+            torch.testing.assert_close(target.network.state_dict()[name], value)
+        backbone_only = select_parts(state_dict, ["backbone"])
+        neck_and_head = select_parts(state_dict, ["neck", "head"])
+        self.assertEqual(set(backbone_only) | set(neck_and_head), set(state_dict))
+        self.assertTrue(
+            all(".backbone." in key for key in backbone_only if key != "ema.num_updates")
+        )
+
     def test_head_levels_are_shifted_for_a_detector_with_a_finer_level(self) -> None:
         """Test that a three-level checkpoint fills the three coarser levels of four.
 

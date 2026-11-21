@@ -1,0 +1,8 @@
+# @package _global_
+# Whole-image traffic light detector with the backbone, the neck and the head of YOLOX-M.
+defaults:
+  - base_960x960_tlr
+  - ../backbone_csp_darknet_m
+  - _self_
+
+experiment_name: yolox_m_960x960_tlr
