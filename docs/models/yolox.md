@@ -189,6 +189,29 @@ autoware-ml train \
     "callbacks.dynamic_validation.epoch_intervals=[[0,5],[50,1]]"
 ```
 
+### Multi-scale training
+
+The multi-scale training of the reference implementation is available and off by default. With
+`model.multiscale_training.enabled=true` the detector resizes every training batch, after the
+data pipeline, to a square whose side changes every `interval` optimizer steps: a multiple of
+`size_divisor` drawn uniformly from `size_range`, both ends included. The images are resized
+with bilinear interpolation and the boxes scaled with them; `min_box_side` is applied before the
+resize and not again. Validation, test, export and the ONNX evaluation stay at `image_size`. The size is a
+function of the optimizer step and of `seed` alone, so every GPU of a distributed run uses the
+same one and a resumed run continues the sequence. By default the resize goes on through the
+last `no_aug_epochs`; `keep_in_no_aug_epochs=false` trains them at `image_size`.
+
+```bash
+autoware-ml train \
+    --config-name detection2d/yolox/t4dataset/yolox_s_960x960_tlr \
+    model.multiscale_training.enabled=true "model.multiscale_training.size_range=[800,1280]"
+```
+
+A step at the largest size needs the most GPU memory, about `(1280 / 960)²` times that of a
+step at 960x960 for the default range, so the batch size has to fit that size. A backbone
+must accept every size of the range: the convolutional backbones do, a transformer backbone
+built for a fixed token grid does not.
+
 ### Transformer backbones
 
 The transformer leaves take their backbone from
@@ -307,29 +330,30 @@ the image resized to fit the network input:
 
 ## Implementation
 
-| Path                                                    | Description                                                                   |
-| ------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| `autoware_ml/models/detection2d/yolox.py`               | Detector and export wrapper                                                   |
-| `autoware_ml/models/detection2d/heads/yolox.py`         | Head, losses and decoding                                                     |
-| `autoware_ml/models/detection2d/task_modules/simota.py` | SimOTA label assignment                                                       |
-| `autoware_ml/models/common/backbones/csp_darknet.py`    | CSPDarknet backbone                                                           |
-| `autoware_ml/models/common/backbones/hgnetv2.py`        | HGNetV2 backbone                                                              |
-| `autoware_ml/models/common/backbones/cspnext.py`        | CSPNeXt backbone                                                              |
-| `autoware_ml/models/common/necks/yolox_pafpn.py`        | PAFPN neck                                                                    |
-| `autoware_ml/models/common/ema.py`                      | Exponential moving average of the weights                                     |
-| `autoware_ml/models/detection2d/yolox_weights.py`       | Conversion of reference checkpoints and ONNX files                            |
-| `autoware_ml/models/detection2d/yolox_onnx.py`          | ONNX backed detector for scoring exported graphs                              |
-| `autoware_ml/databases/t4dataset/t4dataset_2d.py`       | T4 database of camera images with 2D boxes                                    |
-| `autoware_ml/datamodule/t4dataset/detection2d.py`       | Single camera 2D detection dataset                                            |
-| `autoware_ml/transforms/detection2d/`                   | Loading, augmentation and letterbox transforms                                |
-| `autoware_ml/metrics/detection2d/`                      | COCO style evaluation and metric suite                                        |
-| `autoware_ml/callbacks/strong_augmentation_schedule.py` | Schedule ending the strong augmentation                                       |
-| `autoware_ml/utils/schedulers/yolox_warm_cosine.py`     | Warmup, cosine and constant tail learning rate                                |
-| `autoware_ml/scripts/tools/yolox/`                      | Weight conversion and ONNX evaluation tools                                   |
-| `autoware_ml/configs/tasks/detection2d/yolox/`          | Experiment configurations                                                     |
-| `autoware_ml/models/common/backbones/vit.py`            | Plain vision transformer with windowed attention and a simple feature pyramid |
-| `autoware_ml/models/common/backbones/pvt_v2.py`         | PVT v2 backbone                                                               |
-| `autoware_ml/models/detection2d/yolox_layer_decay.py`   | Detector with a learning rate per backbone layer                              |
+| Path                                                        | Description                                                                   |
+| ----------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `autoware_ml/models/detection2d/yolox.py`                   | Detector and export wrapper                                                   |
+| `autoware_ml/models/detection2d/heads/yolox.py`             | Head, losses and decoding                                                     |
+| `autoware_ml/models/detection2d/task_modules/simota.py`     | SimOTA label assignment                                                       |
+| `autoware_ml/models/detection2d/task_modules/multiscale.py` | Multi-scale resize of the training batches                                    |
+| `autoware_ml/models/common/backbones/csp_darknet.py`        | CSPDarknet backbone                                                           |
+| `autoware_ml/models/common/backbones/hgnetv2.py`            | HGNetV2 backbone                                                              |
+| `autoware_ml/models/common/backbones/cspnext.py`            | CSPNeXt backbone                                                              |
+| `autoware_ml/models/common/necks/yolox_pafpn.py`            | PAFPN neck                                                                    |
+| `autoware_ml/models/common/ema.py`                          | Exponential moving average of the weights                                     |
+| `autoware_ml/models/detection2d/yolox_weights.py`           | Conversion of reference checkpoints and ONNX files                            |
+| `autoware_ml/models/detection2d/yolox_onnx.py`              | ONNX backed detector for scoring exported graphs                              |
+| `autoware_ml/databases/t4dataset/t4dataset_2d.py`           | T4 database of camera images with 2D boxes                                    |
+| `autoware_ml/datamodule/t4dataset/detection2d.py`           | Single camera 2D detection dataset                                            |
+| `autoware_ml/transforms/detection2d/`                       | Loading, augmentation and letterbox transforms                                |
+| `autoware_ml/metrics/detection2d/`                          | COCO style evaluation and metric suite                                        |
+| `autoware_ml/callbacks/strong_augmentation_schedule.py`     | Schedule ending the strong augmentation                                       |
+| `autoware_ml/utils/schedulers/yolox_warm_cosine.py`         | Warmup, cosine and constant tail learning rate                                |
+| `autoware_ml/scripts/tools/yolox/`                          | Weight conversion and ONNX evaluation tools                                   |
+| `autoware_ml/configs/tasks/detection2d/yolox/`              | Experiment configurations                                                     |
+| `autoware_ml/models/common/backbones/vit.py`                | Plain vision transformer with windowed attention and a simple feature pyramid |
+| `autoware_ml/models/common/backbones/pvt_v2.py`             | PVT v2 backbone                                                               |
+| `autoware_ml/models/detection2d/yolox_layer_decay.py`       | Detector with a learning rate per backbone layer                              |
 
 ## Acknowledgment
 

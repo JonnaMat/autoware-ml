@@ -13,14 +13,17 @@
 # limitations under the License.
 
 """Unit tests for the YOLOX detector: the training and evaluation paths, the averaged weights,
-the optimizer groups, the mapping of detections back onto the raw image and the export."""
+the optimizer groups, the multi-scale training, the mapping of detections back onto the raw
+image and the export."""
 
 from __future__ import annotations
 
 import math
 from pathlib import Path
 import tempfile
+from typing import Any
 import unittest
+from unittest.mock import PropertyMock, patch
 
 import numpy as np
 import onnx
@@ -32,6 +35,7 @@ from autoware_ml.dataclasses.models.model_outputs import ModelOutputs
 from autoware_ml.models.common.backbones.resnet import ResNet18MultiScale
 from autoware_ml.models.common.necks.yolox_pafpn import YOLOXPAFPN
 from autoware_ml.models.detection2d.heads.yolox import YOLOXHead
+from autoware_ml.models.detection2d.task_modules.multiscale import BatchMultiScaleResize
 from autoware_ml.models.detection2d.tests.yolox_fixtures import build_batch_inputs, build_detector
 from autoware_ml.models.detection2d.yolox import YOLOXDetector
 from autoware_ml.models.module_base_model import LogDictConfigs
@@ -249,6 +253,139 @@ class TestYOLOXDetector(unittest.TestCase):
         metrics = detector.compute_metrics(self.batch, detector(self.batch))
 
         self.assertTrue(torch.isfinite(metrics["loss"]))
+
+
+class TestYOLOXMultiScaleTraining(unittest.TestCase):
+    """Unit tests for the multi-scale training of the detector."""
+
+    def setUp(self) -> None:
+        """Set up a collated batch of two 64x64 images, one without boxes."""
+        torch.manual_seed(0)
+        self.gt_batch = build_batch_inputs(
+            images=torch.rand(2, 3, 64, 64) * 255.0,
+            gt_boxes=[
+                torch.tensor([[8.0, 8.0, 40.0, 40.0], [30.0, 10.0, 50.0, 28.0]]),
+                torch.zeros(0, 4),
+            ],
+            gt_labels=[torch.tensor([0, 1]), torch.zeros(0, dtype=torch.long)],
+        ).multi_task_gt_batch
+
+    @staticmethod
+    def _detector(**arguments: Any) -> YOLOXDetector:
+        """Build a detector resizing its training batches to 96 or 128 pixels."""
+        torch.manual_seed(0)
+        return build_detector(
+            multiscale_training=BatchMultiScaleResize(
+                size_range=[96, 128], interval=10, **arguments
+            )
+        )
+
+    def _steps_of_both_sizes(self, detector: YOLOXDetector) -> dict[int, int]:
+        """Find one optimizer step of each of the two sizes."""
+        steps = {detector.multiscale_training.size_at(step): step for step in range(0, 400, 10)}
+        self.assertEqual(set(steps), {96, 128})
+        return steps
+
+    def test_training_batches_follow_the_size_of_the_global_step(self) -> None:
+        """Test that the detector trains on the batch resized to the size of the step.
+
+        Check: at a step of each of the two sizes the batch has that size, the boxes are
+        scaled with it, the head predicts over the priors of that size and the loss is
+        finite and has gradients.
+        """
+        detector = self._detector().train()
+        boxes = self.gt_batch.detection2d_gt_batch.gt_bboxes_2d
+
+        for size, step in self._steps_of_both_sizes(detector).items():
+            with (
+                self.subTest(size=size),
+                patch.object(
+                    YOLOXDetector, "global_step", new_callable=PropertyMock, return_value=step
+                ),
+            ):
+                batch = detector.on_after_batch_transfer(self.gt_batch, 0)
+                outputs = detector(batch)
+                metrics = detector.compute_metrics(batch, outputs)
+                metrics["loss"].backward()
+
+                self.assertEqual(tuple(batch.image_data.images.shape), (2, 1, 3, size, size))
+                torch.testing.assert_close(
+                    batch.multi_task_gt_batch.detection2d_gt_batch.gt_bboxes_2d,
+                    boxes * (size / 64),
+                )
+                num_priors = sum((size // stride) ** 2 for stride in (8, 16, 32))
+                self.assertEqual(tuple(outputs.detection2d().predictions.shape), (2, num_priors, 7))
+                self.assertTrue(torch.isfinite(metrics["loss"]))
+
+    def test_eval_mode_is_never_resized(self) -> None:
+        """Test that validation, test and export get the batch at the size of the pipeline."""
+        detector = self._detector().eval()
+
+        batch = detector.on_after_batch_transfer(self.gt_batch, 0)
+
+        self.assertIs(batch.image_data, self.gt_batch.image_gt_batch)
+        self.assertIs(batch.multi_task_gt_batch, self.gt_batch)
+
+    def test_disabled_resize_leaves_training_unchanged(self) -> None:
+        """Test that a disabled resize trains exactly as a detector without one.
+
+        Check: the batch is passed on as it is and the losses of the two detectors, built
+        from the same seed, are equal bit for bit.
+        """
+        plain = self._detector(enabled=False).train()
+        torch.manual_seed(0)
+        reference = build_detector().train()
+
+        batch = plain.on_after_batch_transfer(self.gt_batch, 0)
+        reference_batch = reference.on_after_batch_transfer(self.gt_batch, 0)
+        metrics = plain.compute_metrics(batch, plain(batch))
+        reference_metrics = reference.compute_metrics(reference_batch, reference(reference_batch))
+
+        self.assertIs(batch.image_data, self.gt_batch.image_gt_batch)
+        self.assertIs(batch.multi_task_gt_batch, self.gt_batch)
+        self.assertEqual(set(metrics), set(reference_metrics))
+        for name, value in reference_metrics.items():
+            self.assertTrue(torch.equal(metrics[name], value), name)
+
+    def test_no_augmentation_epochs_keep_the_resize_unless_configured(self) -> None:
+        """Test the last epochs of a run, trained without strong augmentation.
+
+        Check: by default their batches are still resized; with ``keep_in_no_aug_epochs``
+        off they are not, and are again once the strong augmentation is back on.
+        """
+        keeping = self._detector().train()
+        stopping = self._detector(keep_in_no_aug_epochs=False).train()
+
+        keeping.set_strong_augmentation(False)
+        stopping.set_strong_augmentation(False)
+        kept = keeping.on_after_batch_transfer(self.gt_batch, 0)
+        stopped = stopping.on_after_batch_transfer(self.gt_batch, 0)
+        stopping.set_strong_augmentation(True)
+        restarted = stopping.on_after_batch_transfer(self.gt_batch, 0)
+
+        self.assertNotEqual(kept.image_data.images.shape[-1], 64)
+        self.assertIs(stopped.image_data, self.gt_batch.image_gt_batch)
+        self.assertNotEqual(restarted.image_data.images.shape[-1], 64)
+
+    def test_degenerate_boxes_give_a_finite_loss(self) -> None:
+        """Test that boxes without width or height do not break the loss, L1 term included."""
+        gt_batch = build_batch_inputs(
+            images=torch.rand(2, 3, 64, 64) * 255.0,
+            gt_boxes=[
+                torch.tensor([[20.0, 20.0, 20.0, 30.0], [40.0, 12.0, 40.0, 12.0]]),
+                torch.tensor([[8.0, 8.0, 8.5, 8.5]]),
+            ],
+            gt_labels=[torch.tensor([0, 1]), torch.tensor([1])],
+        ).multi_task_gt_batch
+        detector = self._detector().train()
+        detector.set_strong_augmentation(False)
+
+        batch = detector.on_after_batch_transfer(gt_batch, 0)
+        metrics = detector.compute_metrics(batch, detector(batch))
+        metrics["loss"].backward()
+
+        self.assertTrue(all(torch.isfinite(value).all() for value in metrics.values()))
+        self.assertTrue(all(torch.isfinite(p.grad).all() for p in detector.network.parameters()))
 
 
 class TestYOLOXExport(unittest.TestCase):

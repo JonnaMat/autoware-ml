@@ -91,6 +91,20 @@ model:
   # runtimes deliver BGR. null exports the order of the backbone.
   export_input_channel_order: bgr
 
+  # Multi-scale training, off by default: every `interval` optimizer steps the training batch
+  # is resized to a square of a side drawn from the multiples of size_divisor within
+  # size_range, the boxes with it. Validation, test and export stay at image_size. The range
+  # suits a 960x960 input; the largest size sets the GPU memory a step needs.
+  multiscale_training:
+    _target_: autoware_ml.models.detection2d.task_modules.multiscale.BatchMultiScaleResize
+    enabled: false
+    size_range: [800, 1280]
+    size_divisor: 32
+    interval: 10
+    # Whether the last no_aug_epochs are resized too. false trains them at image_size.
+    keep_in_no_aug_epochs: true
+    seed: ${seed}
+
   # The backbone returns the feature maps at strides 8, 16 and 32. A leaf composes one of the
   # backbone_* blocks, which also tells the neck the channels of those feature maps. The
   # backbone_*_p2 blocks add the feature map at stride 4 as a fourth level of the neck and head.

@@ -19,7 +19,8 @@ maps at strides 8, 16 and 32 and the neck fuses them, so another backbone or nec
 change. A backbone that also returns the map at stride 4 gives the neck and the head a fourth
 level. The training recipe follows the YOLOX reference implementation
 (https://github.com/Megvii-BaseDetection/YOLOX, Apache-2.0): an exponential moving average of
-the weights is kept and evaluated, and the L1 box loss is turned on for the last epochs.
+the weights is kept and evaluated, the L1 box loss is turned on for the last epochs, and the
+training batches can be resized to a size that changes every few steps.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from torch import Tensor
 import torch.nn as nn
 
 from autoware_ml.dataclasses.batch.detection2d import Detection2DGTBatch
+from autoware_ml.dataclasses.batch.sample_batch import ModelGTBatch
 from autoware_ml.dataclasses.models.detection2d.head_outputs import YOLOXHeadOutputs
 from autoware_ml.dataclasses.models.detection2d.predictions import (
     Detection2DSamplePredictions,
@@ -47,6 +49,7 @@ from autoware_ml.metrics.eval_output import (
 )
 from autoware_ml.models.common.ema import ModelEMA
 from autoware_ml.models.detection2d.heads.yolox import YOLOXHead
+from autoware_ml.models.detection2d.task_modules.multiscale import BatchMultiScaleResize
 from autoware_ml.models.module_base_model import LogDictConfigs, ModuleBaseModel
 from autoware_ml.utils.deploy import ExportSpec
 
@@ -150,6 +153,7 @@ class YOLOXDetector(ModuleBaseModel):
         max_detections: int | None = 300,
         export_background_class: bool = False,
         export_input_channel_order: str | None = None,
+        multiscale_training: BatchMultiScaleResize | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the detector.
@@ -179,6 +183,9 @@ class YOLOXDetector(ModuleBaseModel):
               ``rgb``. When it differs from ``input_channel_order`` the graph reorders the
               channels itself, so every backbone is deployed behind the same input. None
               deploys the order the backbone reads.
+            multiscale_training: Resize of the training batches to a size that changes every
+              few optimizer steps, None or a disabled one for none. Validation, test,
+              prediction and export always run at the size the data pipeline serves.
             **kwargs: Arguments of :class:`ModuleBaseModel`.
 
         Raises:
@@ -207,6 +214,8 @@ class YOLOXDetector(ModuleBaseModel):
         self.class_agnostic_nms = class_agnostic_nms
         self.max_detections = max_detections
         self.export_background_class = export_background_class
+        self.multiscale_training = multiscale_training
+        self._strong_augmentation = True
 
     @property
     def head(self) -> YOLOXHead:
@@ -236,6 +245,27 @@ class YOLOXDetector(ModuleBaseModel):
             enabled: Whether the training samples are still strongly augmented.
         """
         self.head.use_l1 = not enabled
+        self._strong_augmentation = enabled
+
+    def on_after_batch_transfer(self, batch: ModelGTBatch, dataloader_idx: int) -> ModelBatchInputs:
+        """Preprocess a batch and, in training, resize it to the size of the optimizer step.
+
+        The size follows the global step, which every rank of a distributed run shares.
+
+        Args:
+            batch: Collated batch on the target device.
+            dataloader_idx: Lightning dataloader index.
+
+        Returns:
+            The model inputs, resized when multi-scale training is on for the step.
+        """
+        batch_inputs = super().on_after_batch_transfer(batch, dataloader_idx)
+        multiscale = self.multiscale_training
+        if multiscale is None or not multiscale.enabled or not self.training:
+            return batch_inputs
+        if not self._strong_augmentation and not multiscale.keep_in_no_aug_epochs:
+            return batch_inputs
+        return multiscale(batch_inputs, self.global_step)
 
     def prepare_images(
         self, batch_inputs: ModelBatchInputs
