@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 
 from autoware_ml.models.common.backbones.csp_darknet import CSPDarknet
-from autoware_ml.models.common.backbones.resnet import ResNet18MultiScale
+from autoware_ml.models.common.backbones.resnet import ResNet18MultiScale, ResNet50MultiScale
 from autoware_ml.models.common.necks.yolox_pafpn import YOLOXPAFPN
 
 
@@ -54,6 +54,38 @@ class TestYOLOXPAFPN(unittest.TestCase):
                 self.assertEqual(
                     [tuple(o.shape[1:]) for o in outputs], [(128, 8, 8), (256, 4, 4), (512, 2, 2)]
                 )
+
+    def test_neck_takes_the_features_of_the_wider_backbones(self) -> None:
+        """Test that the neck fuses the features of the YOLOX-M CSPDarknet and of a ResNet-50.
+
+        Check: the output levels keep the widths of the backbone, 192, 384 and 768 channels
+        or 512, 1024 and 2048.
+        """
+        images = torch.randn(1, 3, 64, 64)
+        backbones = {
+            "csp_darknet_m": CSPDarknet(deepen_factor=0.67, widen_factor=0.75),
+            "resnet50": ResNet50MultiScale(in_channels=3, out_indices=[1, 2, 3]),
+        }
+        widths = {"csp_darknet_m": (192, 384, 768), "resnet50": (512, 1024, 2048)}
+        for name, backbone in backbones.items():
+            with self.subTest(backbone=name), torch.no_grad():
+                neck = YOLOXPAFPN(in_channels=widths[name], deepen_factor=0.67).eval()
+                outputs = neck(backbone.eval()(images))
+                self.assertEqual(
+                    [tuple(o.shape[1:]) for o in outputs],
+                    [(widths[name][0], 8, 8), (widths[name][1], 4, 4), (widths[name][2], 2, 2)],
+                )
+
+    def test_medium_neck_has_the_depth_and_parameter_count_of_the_reference(self) -> None:
+        """Test that the YOLOX-M neck holds two bottlenecks per CSP layer and 8.68 M parameters."""
+        neck = YOLOXPAFPN(in_channels=[192, 384, 768], deepen_factor=0.67)
+
+        num_bottlenecks = [
+            len(layer.m) for layer in (neck.C3_p4, neck.C3_p3, neck.C3_n3, neck.C3_n4)
+        ]
+
+        self.assertEqual(num_bottlenecks, [2, 2, 2, 2])
+        self.assertEqual(sum(p.numel() for p in neck.parameters()), 8_679_168)
 
     def test_number_of_levels_is_checked(self) -> None:
         """Test that fewer than three or more than four levels are refused, at build and at call."""
