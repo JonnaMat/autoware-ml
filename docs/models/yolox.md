@@ -29,6 +29,7 @@ the CLI as the path relative to `tasks/`.
 | `detection2d/yolox/t4dataset/yolox_s_960x960_tlr`             | CSPDarknet   | Whole-image traffic light detector, YOLOX-S                                       |
 | `detection2d/yolox/t4dataset/yolox_m_960x960_tlr`             | CSPDarknet   | The same detector with the backbone, the neck and the head of YOLOX-M             |
 | `detection2d/yolox/t4dataset/resnet18_960x960_tlr`            | ResNet-18    | The same detector with a ResNet-18 backbone                                       |
+| `detection2d/yolox/t4dataset/resnet50_960x960_tlr`            | ResNet-50    | A ResNet-50 backbone under the neck and the head of YOLOX-M                       |
 | `detection2d/yolox/t4dataset/resnet50_native_960x960_tlr`     | ResNet-50    | ResNet-50 with a neck of the widths of its backbone                               |
 | `detection2d/yolox/t4dataset/hgnetv2_b0_960x960_tlr`          | HGNetV2-B0   | The same detector with an HGNetV2-B0 backbone                                     |
 | `detection2d/yolox/t4dataset/hgnetv2_b1_960x960_tlr`          | HGNetV2-B1   | The same detector with an HGNetV2-B1 backbone                                     |
@@ -56,6 +57,7 @@ The config tree separates what two detectors share from what tells them apart:
 | `backbone_csp_darknet_s.yaml`     | CSPDarknet of YOLOX-S and its input convention                      |
 | `backbone_csp_darknet_m.yaml`     | CSPDarknet, neck depth and head width of YOLOX-M                    |
 | `backbone_resnet18.yaml`          | ResNet-18 of torchvision and its input normalization                |
+| `backbone_resnet50.yaml`          | ResNet-50 of torchvision, its projections, YOLOX-M neck and head    |
 | `backbone_resnet50_native.yaml`   | ResNet-50 of torchvision, its input normalization and neck widths   |
 | `backbone_hgnetv2_*.yaml`         | HGNetV2 of timm, its input normalization and its projections        |
 | `backbone_cspnext_s*.yaml`        | CSPNeXt-S of RTMDet and the input convention of its weights         |
@@ -77,11 +79,26 @@ reference implementation, which `convert_weights` converts like the one of YOLOX
 or by its parts.
 
 The stages of ResNet-50 are four times as wide as those of ResNet-18 (512, 1024 and 2048
-channels). The neck keeps the width of its inputs, so the `backbone_resnet50_native` block makes
-it four times as wide as that of YOLOX-S, wider than the neck of any YOLOX model; the head keeps
-its 128 channels. The ImageNet weights of torchvision are downloaded into the torch hub cache with
-`model.backbone.weights=IMAGENET1K_V2` or `model.backbone.weights=IMAGENET1K_V1`. No converted
-YOLOX checkpoint fits the neck of this leaf.
+channels). The `backbone_resnet50` block adds a 1x1 convolution block per level that projects them
+to 192, 384 and 768 channels (`model.backbone.projection_channels`) and sets the neck depth and
+the head width of YOLOX-M, so the neck and the head are those of `yolox_m_960x960_tlr` and the
+neck and head part of the converted YOLOX-M checkpoint initializes them. The
+`backbone_resnet50_native` block passes the stage outputs on instead: the neck keeps the width of
+its inputs and becomes four times as wide as that of YOLOX-S, wider than the neck of any YOLOX
+model, the head keeps its 128 channels, and no converted YOLOX checkpoint fits. The ImageNet
+weights of torchvision are downloaded into the torch hub cache with
+`model.backbone.weights=IMAGENET1K_V2` or `model.backbone.weights=IMAGENET1K_V1`; the projection
+blocks are new layers and keep their initialization:
+
+```bash
+python -m autoware_ml.scripts.tools.yolox.convert_weights yolox_m.pth yolox_m_coco_neck_head.ckpt \
+    --parts neck head
+
+autoware-ml train \
+    --config-name detection2d/yolox/t4dataset/resnet50_960x960_tlr \
+    model.backbone.weights=IMAGENET1K_V2 \
+    --weights yolox_m_coco_neck_head.ckpt --skip-mismatched-weights
+```
 
 The stages of HGNetV2 are twice as wide as those of YOLOX-S (256, 512 and 1024 channels). The
 `hgnetv2_b0` and `hgnetv2_b1` blocks add a 1x1 convolution block per level that projects them to
