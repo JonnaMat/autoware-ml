@@ -187,6 +187,92 @@ class TestResNetMultiScale(_ResNetTestCase):
         self.assertFalse(hasattr(backbone, "fc"))
 
 
+class TestResNetProjection(_ResNetTestCase):
+    """Unit tests for the optional projection blocks of the multi-scale ResNets."""
+
+    def test_projection_sets_the_output_widths(self) -> None:
+        """Test that the projection blocks give the requested widths at the same strides."""
+        backbone = (
+            ResNet50MultiScale(in_channels=3, projection_channels=[192, 384, 768])
+            .to(self.device)
+            .eval()
+        )
+
+        with torch.no_grad():
+            features = backbone(self.images)
+
+        self.assertEqual(backbone.out_channels, (192, 384, 768))
+        self.assertEqual(
+            [tuple(feature.shape) for feature in features],
+            [
+                (self.batch_size, 192, 16, 16),
+                (self.batch_size, 384, 8, 8),
+                (self.batch_size, 768, 4, 4),
+            ],
+        )
+
+    def test_projection_leaves_the_stages_unchanged(self) -> None:
+        """Test that the stage parameters keep their names and values when projections are added.
+
+        Check: the projected backbone holds the keys of the plain one plus keys below
+        ``projections.``, and with the same seed its stages start from the same draw.
+        """
+        torch.manual_seed(0)
+        plain = ResNet50MultiScale(in_channels=3)
+        torch.manual_seed(0)
+        projected = ResNet50MultiScale(in_channels=3, projection_channels=[192, 384, 768])
+
+        added = set(projected.state_dict()) - set(plain.state_dict())
+
+        self.assertTrue(set(plain.state_dict()) <= set(projected.state_dict()))
+        self.assertTrue(added)
+        self.assertTrue(all(key.startswith("projections.") for key in added))
+        for name, value in plain.state_dict().items():
+            torch.testing.assert_close(projected.state_dict()[name], value)
+
+    def test_default_is_the_backbone_without_projections(self) -> None:
+        """Test that a backbone without projection widths is the one from before the option.
+
+        Check: no projection module is registered, the state dict holds exactly the keys of
+        the torchvision stages, the stages start from the draw of the single-scale backbone,
+        which has no such option, and the features are the outputs of the torchvision stages.
+        """
+        torch.manual_seed(0)
+        reference = ResNet18(in_channels=3).eval()
+        torch.manual_seed(0)
+        backbone = ResNet18MultiScale(in_channels=3, projection_channels=None).eval()
+        torch.manual_seed(0)
+        default = ResNet18MultiScale(in_channels=3).eval()
+        images = self.images.cpu()
+
+        self.assertIsNone(backbone.projections)
+        self.assertEqual(backbone.out_channels, (128, 256, 512))
+        self.assertEqual(ResNet50MultiScale(in_channels=3).out_channels, (512, 1024, 2048))
+        self.assertFalse(any("projection" in name for name, _ in backbone.named_modules()))
+        self.assertEqual(
+            list(backbone.state_dict()),
+            [key for key in resnet18().state_dict() if not key.startswith("fc.")],
+        )
+        for name, value in reference.state_dict().items():
+            torch.testing.assert_close(backbone.state_dict()[name], value)
+            torch.testing.assert_close(default.state_dict()[name], value)
+        with torch.no_grad():
+            c2 = reference.layer1(reference.forward_stem(images))
+            c3 = reference.layer2(c2)
+            c4 = reference.layer3(c3)
+            c5 = reference.layer4(c4)
+            features = backbone(images)
+        for feature, expected in zip(features, (c3, c4, c5), strict=True):
+            self.assertTrue(torch.equal(feature, expected))
+
+    def test_projection_widths_are_validated(self) -> None:
+        """Test that one projection width per returned stage is required."""
+        with self.assertRaises(ValueError):
+            ResNet50MultiScale(in_channels=3, projection_channels=[192, 384])
+        with self.assertRaises(ValueError):
+            ResNet18MultiScale(in_channels=3, out_indices=[2, 3], projection_channels=[64, 64, 64])
+
+
 class TestResNet18(_ResNetTestCase):
     """Unit tests for the single-scale ResNet-18 backbone."""
 
@@ -326,6 +412,41 @@ class TestTorchvisionWeights(unittest.TestCase):
             ResNet50MultiScale(in_channels=3, weights="NOT_A_WEIGHT_SET")
         self.assertIn("IMAGENET1K_V1", ResNet50_Weights.__members__)
         self.assertIn("IMAGENET1K_V2", ResNet50_Weights.__members__)
+
+    def test_state_dict_file_loads_below_the_projections(self) -> None:
+        """
+        Input: the state dict file into a backbone with projection blocks, at construction
+            and once more afterwards.
+        Expected: the stages load, the projection blocks keep their initialization.
+        Check: a stage weight matches the reference, the projection weights are unchanged by
+            the second load, and a truncated file is still refused.
+        """
+        backbone = ResNet18MultiScale(
+            in_channels=3, weights=self.path, projection_channels=[32, 64, 128]
+        )
+        projections = {
+            name: value.clone()
+            for name, value in backbone.state_dict().items()
+            if name.startswith("projections.")
+        }
+
+        backbone.load_torchvision_weights(self.path)
+
+        torch.testing.assert_close(
+            backbone.layer4[1].conv2.weight, self.reference.layer4[1].conv2.weight
+        )
+        self.assertTrue(projections)
+        for name, value in projections.items():
+            torch.testing.assert_close(backbone.state_dict()[name], value)
+        truncated = {
+            key: value
+            for key, value in self.reference.state_dict().items()
+            if not key.startswith("layer4.")
+        }
+        path = Path(self.directory.name) / "truncated.pth"
+        torch.save(truncated, path)
+        with self.assertRaisesRegex(ValueError, "layer4.0.conv1.weight"):
+            backbone.load_torchvision_weights(path)
 
     def test_load_without_weights_is_unchanged(self) -> None:
         """

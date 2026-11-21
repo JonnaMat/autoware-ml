@@ -34,6 +34,8 @@ from torchvision.models.resnet import (
     ResNet50_Weights,
 )
 
+from autoware_ml.models.common.layers.csp import ConvBNAct
+
 logger = logging.getLogger(__name__)
 
 
@@ -127,6 +129,8 @@ class _ResNetStages(nn.Module):
 
         The classifier of the state dict is dropped, and the stem convolution is skipped
         when the backbone reads another number of channels than the three of the state dict.
+        Projection blocks of a multi-scale backbone are no part of a torchvision state dict
+        and keep their initialization.
 
         Args:
             weights: Name of a torchvision weight set, resolved through ``weights_enum``, or
@@ -169,13 +173,22 @@ class _ResNetStages(nn.Module):
             )
             # Keep the backbone's own stem, so a strict load still checks every other key.
             state_dict["conv1.weight"] = self.conv1.weight.detach().clone()
+        num_tensors = len(state_dict)
+        # Keep the backbone's own projection blocks too, for the same strict check.
+        state_dict.update(
+            {
+                key: value.detach().clone()
+                for key, value in self.state_dict().items()
+                if key.startswith("projections.")
+            }
+        )
         try:
             self.load_state_dict(state_dict, strict=True)
         except RuntimeError as error:
             raise ValueError(
                 f"{source} does not hold the stage parameters of this backbone: {error}"
             ) from error
-        logger.info("Loaded %d tensors of %s.", len(state_dict), source)
+        logger.info("Loaded %d tensors of %s.", num_tensors, source)
 
     def forward_stem(
         self, x: Float32[Tensor, "batch_size in_channels height width"]
@@ -255,6 +268,11 @@ class _ResNetMultiScale(_ResNetStages):
     ``layer{i + 1}``, so ``0`` to ``3`` are the stage outputs ``c2`` to ``c5`` at strides 4, 8,
     16 and 32. The default ``(1, 2, 3)`` returns ``(c3, c4, c5)``; ``(0, 1, 2, 3)`` adds the
     stride-4 level in front.
+
+    ``projection_channels`` adds a 1x1 convolution block behind every returned stage, which
+    lets a neck built for narrower feature maps take the 512, 1024 and 2048 channels of a
+    bottleneck ResNet. The projections are new layers a torchvision state dict does not hold.
+    Without them the backbone is the plain torchvision one, with its parameter names.
     """
 
     def __init__(
@@ -265,6 +283,8 @@ class _ResNetMultiScale(_ResNetStages):
         out_indices: Sequence[int] = (1, 2, 3),
         weights: str | Path | None = None,
         weights_enum: type[WeightsEnum] | None = None,
+        projection_channels: Sequence[int] | None = None,
+        projection_activation: str = "silu",
     ) -> None:
         """Initialize the multi-scale ResNet backbone.
 
@@ -277,10 +297,14 @@ class _ResNetMultiScale(_ResNetStages):
             weights: Torchvision weight set name or state dict path, see
                 :meth:`_ResNetStages.load_torchvision_weights`.
             weights_enum: The torchvision weight sets of this architecture.
+            projection_channels: Output channels of a 1x1 convolution block per returned
+                stage, None to return the stage outputs as they are.
+            projection_activation: Activation name of the projection blocks.
 
         Raises:
             ValueError: If ``out_indices`` is empty, holds an index outside ``0`` to ``3``, or
-                is not strictly increasing.
+                is not strictly increasing, or ``projection_channels`` does not name one width
+                per returned stage.
         """
         super().__init__(
             block=block,
@@ -290,6 +314,22 @@ class _ResNetMultiScale(_ResNetStages):
             weights_enum=weights_enum,
         )
         self.out_indices = self._validate_out_indices(out_indices)
+        stage_channels = tuple(64 * 2**index * block.expansion for index in self.out_indices)
+        if projection_channels is None:
+            self.projections = None
+            self.out_channels = stage_channels
+        else:
+            widths = tuple(int(channels) for channels in projection_channels)
+            if len(widths) != len(self.out_indices):
+                raise ValueError(
+                    f"projection_channels names {len(widths)} widths for "
+                    f"{len(self.out_indices)} returned stages."
+                )
+            self.projections = nn.ModuleList(
+                ConvBNAct(channels, width, 1, 1, activation=projection_activation)
+                for channels, width in zip(stage_channels, widths)
+            )
+            self.out_channels = widths
 
     @staticmethod
     def _validate_out_indices(out_indices: Sequence[int]) -> tuple[int, ...]:
@@ -325,7 +365,8 @@ class _ResNetMultiScale(_ResNetStages):
         Returns:
             Tuple with one feature map per entry of ``out_indices``, in increasing stage order.
             Stage ``i`` is at stride ``4 * 2**i``; the channel widths depend on the block type,
-            64 to 512 for basic blocks and 256 to 2048 for bottlenecks.
+            64 to 512 for basic blocks and 256 to 2048 for bottlenecks, or are those of
+            ``projection_channels``.
         """
         x = self.forward_stem(x)
         c2 = self.layer1(x)
@@ -333,7 +374,13 @@ class _ResNetMultiScale(_ResNetStages):
         c4 = self.layer3(c3)
         c5 = self.layer4(c4)
         stages = (c2, c3, c4, c5)
-        return tuple(stages[i] for i in self.out_indices)
+        selected = tuple(stages[i] for i in self.out_indices)
+        if self.projections is None:
+            return selected
+        return tuple(
+            projection(feature)
+            for projection, feature in zip(self.projections, selected, strict=True)
+        )
 
 
 class ResNet18MultiScale(_ResNetMultiScale):
@@ -348,6 +395,8 @@ class ResNet18MultiScale(_ResNetMultiScale):
         in_channels: int,
         out_indices: Sequence[int] = (1, 2, 3),
         weights: str | Path | None = None,
+        projection_channels: Sequence[int] | None = None,
+        projection_activation: str = "silu",
     ) -> None:
         """Initialize the multi-scale ResNet18 backbone.
 
@@ -357,6 +406,9 @@ class ResNet18MultiScale(_ResNetMultiScale):
                 returned, where index ``i`` selects ``layer{i + 1}``.
             weights: Torchvision weight set name or state dict path, see
                 :meth:`_ResNetStages.load_torchvision_weights`.
+            projection_channels: Output channels of a 1x1 convolution block per returned
+                stage, None to return the stage outputs as they are.
+            projection_activation: Activation name of the projection blocks.
         """
         super().__init__(
             block=BasicBlock,
@@ -365,6 +417,8 @@ class ResNet18MultiScale(_ResNetMultiScale):
             out_indices=out_indices,
             weights=weights,
             weights_enum=ResNet18_Weights,
+            projection_channels=projection_channels,
+            projection_activation=projection_activation,
         )
 
 
@@ -380,6 +434,8 @@ class ResNet50MultiScale(_ResNetMultiScale):
         in_channels: int,
         out_indices: Sequence[int] = (1, 2, 3),
         weights: str | Path | None = None,
+        projection_channels: Sequence[int] | None = None,
+        projection_activation: str = "silu",
     ) -> None:
         """Initialize the multi-scale ResNet50 backbone.
 
@@ -390,6 +446,9 @@ class ResNet50MultiScale(_ResNetMultiScale):
             weights: Torchvision weight set name or state dict path, see
                 :meth:`_ResNetStages.load_torchvision_weights`; ``IMAGENET1K_V1`` gives the
                 ImageNet weights the Sparse4D reference starts from.
+            projection_channels: Output channels of a 1x1 convolution block per returned
+                stage, None to return the stage outputs as they are.
+            projection_activation: Activation name of the projection blocks.
         """
         super().__init__(
             block=Bottleneck,
@@ -398,4 +457,6 @@ class ResNet50MultiScale(_ResNetMultiScale):
             out_indices=out_indices,
             weights=weights,
             weights_enum=ResNet50_Weights,
+            projection_channels=projection_channels,
+            projection_activation=projection_activation,
         )
