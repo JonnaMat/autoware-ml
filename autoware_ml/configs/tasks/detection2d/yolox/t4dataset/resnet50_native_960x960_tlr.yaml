@@ -1,0 +1,8 @@
+# @package _global_
+# Whole-image traffic light detector with a ResNet-50 backbone and a neck of its widths.
+defaults:
+  - base_960x960_tlr
+  - ../backbone_resnet50_native
+  - _self_
+
+experiment_name: resnet50_native_960x960_tlr

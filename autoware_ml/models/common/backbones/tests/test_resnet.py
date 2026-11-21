@@ -137,6 +137,35 @@ class TestResNetMultiScale(_ResNetTestCase):
         self.assertEqual(c4.shape, (self.batch_size, 1024, 8, 8))
         self.assertEqual(c5.shape, (self.batch_size, 2048, 4, 4))
 
+    def test_resnet50_returns_three_feature_levels_by_default(self) -> None:
+        """Test that ResNet-50 returns ``layer2`` to ``layer4`` at strides 8, 16 and 32 by default."""
+        backbone = ResNet50MultiScale(in_channels=3).to(self.device).eval()
+
+        with torch.no_grad():
+            features = backbone(self.images)
+
+        self.assertEqual(backbone.out_indices, (1, 2, 3))
+        self.assertEqual(
+            [tuple(feature.shape) for feature in features],
+            [
+                (self.batch_size, 512, 16, 16),
+                (self.batch_size, 1024, 8, 8),
+                (self.batch_size, 2048, 4, 4),
+            ],
+        )
+
+    def test_resnet50_has_the_parameter_count_of_torchvision(self) -> None:
+        """Test that ResNet-50 holds the parameters of the torchvision network without its classifier."""
+        reference = resnet50()
+        expected = sum(p.numel() for p in reference.parameters()) - sum(
+            p.numel() for p in reference.fc.parameters()
+        )
+
+        num_parameters = sum(p.numel() for p in ResNet50MultiScale(in_channels=3).parameters())
+
+        self.assertEqual(num_parameters, expected)
+        self.assertEqual(num_parameters, 23_508_032)
+
     def test_in_channels_rebuilds_the_stem(self) -> None:
         """Test that a non-RGB input width is accepted by the stem convolution."""
         backbone = ResNet18MultiScale(in_channels=1, out_indices=[0]).to(self.device).eval()
