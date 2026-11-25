@@ -1144,6 +1144,26 @@ class SerializedUnpooling(PointModule):
         parent.feat = parent.feat + point.feat[inverse]
         return parent
 
+    @torch.no_grad()
+    def fold_batch_norm(self) -> None:
+        """Fold the batch norm of both projections into the linear layer before it.
+
+        In eval mode the batch norm is the affine map ``y = s (x - mean) + beta`` with
+        ``s = gamma / sqrt(var + eps)``, so ``BN(Linear(W, b)(x))`` equals
+        ``Linear(s W, s (b - mean) + beta)(x)``, ``s`` scaling the output channels. Each
+        projection then runs as the linear layer followed by its GELU. Meant for an export copy,
+        the parameters change in place.
+        """
+        for projection in (self.proj, self.proj_skip):
+            linear, norm, _ = projection.children()
+            scale = norm.weight.double() * torch.rsqrt(norm.running_var.double() + norm.eps)
+            folded_weight = linear.weight.double() * scale[:, None]
+            folded_bias = (linear.bias.double() - norm.running_mean.double()) * scale
+            folded_bias = folded_bias + norm.bias.double()
+            linear.weight.copy_(folded_weight.to(linear.weight.dtype))
+            linear.bias.copy_(folded_bias.to(linear.bias.dtype))
+            projection.add_module("1", nn.Identity())
+
 
 class Embedding(PointModule):
     """Embed raw point features with the PTv3 sparse-convolution stem.
@@ -1220,7 +1240,7 @@ def prepare_point_module_for_export(module: nn.Module) -> None:
     """Switch a PTv3 point-module hierarchy into export mode in place.
 
     Args:
-        module: Module hierarchy whose attention, pooling, sparse-conv, and
+        module: Module hierarchy whose attention, pooling, unpooling, sparse-conv, and
             positional-encoding children are reconfigured for ONNX export.
     """
     replace_submconv3d_for_export(module)
@@ -1237,6 +1257,8 @@ def prepare_point_module_for_export(module: nn.Module) -> None:
             child.shuffle_orders = False
         if isinstance(child, Cpe):
             child.fold_linear()
+        if isinstance(child, SerializedUnpooling):
+            child.fold_batch_norm()
 
 
 def deepcopy_without_flash(module: nn.Module) -> nn.Module:

@@ -21,6 +21,8 @@ import math
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from omegaconf import OmegaConf
+import onnx
 import pytest
 import torch
 import torch.nn as nn
@@ -52,6 +54,7 @@ from autoware_ml.models.segmentation3d.encoders.ptv3 import (
     PointTransformerV3Encoder,
     SerializedAttention,
     SerializedPooling,
+    SerializedUnpooling,
     build_patch_order,
     build_serialized_pooling_meta,
 )
@@ -73,6 +76,7 @@ from autoware_ml.models.segmentation3d.ptv3_base import (
     validate_serialization_geometry,
 )
 from autoware_ml.ops.spconv.availability import IS_SPCONV_AVAILABLE
+from autoware_ml.utils.deploy import export_to_onnx
 
 
 def test_serialized_attention_requires_supported_flash_configuration() -> None:
@@ -1423,5 +1427,59 @@ def test_export_folds_the_cpe_linear_layer_into_the_convolution(monkeypatch) -> 
         assert blocks, name
         for block in blocks:
             assert not any(isinstance(module, nn.Linear) for module in block.cpe.modules()), name
+    for key, value in model.state_dict().items():
+        assert torch.equal(value, state[key]), key
+
+
+@pytest.mark.skipif(
+    not IS_SPCONV_AVAILABLE or not torch.cuda.is_available(),
+    reason="PTv3 sparse-convolution export tests require CUDA spconv",
+)
+def test_export_folds_the_unpooling_batch_norms_into_the_projections(monkeypatch, tmp_path) -> None:
+    """
+    Input: a small PTv3 segmentation model with every bias and normalization set to a
+    non-trivial value, exported with and without the unpooling batch-norm fold.
+    Expected: the fold changes no export output and no model parameter; the seg3d head's
+    decoder up blocks keep no batch norm, so its ONNX has no BatchNormalization node, while
+    the encoder export is untouched.
+    Check: the float outputs of the encoder and seg3d head export modules match within 1e-5,
+    the head export module holds no BatchNorm1d, its ONNX (TorchScript exporter, opset 17)
+    has no BatchNormalization node while the unfolded one has two per up block, and the
+    model's state_dict is unchanged.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    model = build_seg3d_model()
+    _jitter_affine_parameters(model)
+    model = model.to(device).eval()
+    batch = build_inputs(device=device)
+    state = {key: value.clone() for key, value in model.state_dict().items()}
+    onnx_cfg = OmegaConf.create(
+        {"opset_version": 17, "dynamo": False, "do_constant_folding": False}
+    )
+
+    folded = model.build_export_specs(batch)
+    export_to_onnx(folded["ptv3_seg3d_head"], onnx_cfg, tmp_path / "folded.onnx")
+    monkeypatch.setattr(SerializedUnpooling, "fold_batch_norm", lambda unpooling: None)
+    reference = model.build_export_specs(batch)
+    export_to_onnx(reference["ptv3_seg3d_head"], onnx_cfg, tmp_path / "reference.onnx")
+
+    for name in ("ptv3_encoder", "ptv3_seg3d_head"):
+        with torch.no_grad():
+            folded_outputs = folded[name].module(*folded[name].args)
+            reference_outputs = reference[name].module(*reference[name].args)
+        for folded_output, reference_output in zip(folded_outputs, reference_outputs, strict=True):
+            if folded_output.is_floating_point():
+                torch.testing.assert_close(folded_output, reference_output, rtol=1e-5, atol=1e-5)
+    head = folded["ptv3_seg3d_head"].module
+    up_blocks = [module for module in head.modules() if isinstance(module, SerializedUnpooling)]
+    assert up_blocks
+    assert not any(isinstance(module, nn.BatchNorm1d) for module in head.modules())
+
+    def batch_norm_count(path) -> int:
+        return sum(node.op_type == "BatchNormalization" for node in onnx.load(path).graph.node)
+
+    assert batch_norm_count(tmp_path / "folded.onnx") == 0
+    assert batch_norm_count(tmp_path / "reference.onnx") == 2 * len(up_blocks)
     for key, value in model.state_dict().items():
         assert torch.equal(value, state[key]), key

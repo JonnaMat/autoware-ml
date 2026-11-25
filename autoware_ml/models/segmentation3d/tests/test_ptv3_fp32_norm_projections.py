@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The projections that feed a BatchNorm stay in fp32 under autocast."""
+"""The projections that feed a BatchNorm stay in fp32 under autocast and fold it on export."""
 
 from __future__ import annotations
 
+from copy import deepcopy
+from pathlib import Path
+import tempfile
 import unittest
 
+import onnx
 import torch
 from torch import nn
 
@@ -92,6 +96,81 @@ class TestSerializedUnpooling(unittest.TestCase):
         self.assertIn("proj_skip.0.weight", keys)
         self.assertIn("proj.1.running_mean", keys)
         self.assertIn("proj_skip.1.running_mean", keys)
+
+
+def _unpooling_with_trained_batch_norms() -> SerializedUnpooling:
+    """Return an eval-mode unpooling whose batch norms hold non-trivial statistics."""
+    torch.manual_seed(2)
+    module = SerializedUnpooling(16, 8, 12)
+    for norm in (module.proj.get_submodule("1"), module.proj_skip.get_submodule("1")):
+        nn.init.uniform_(norm.weight, 0.5, 1.5)
+        nn.init.uniform_(norm.bias, -0.5, 0.5)
+        nn.init.uniform_(norm.running_mean, -0.5, 0.5)
+        nn.init.uniform_(norm.running_var, 0.1, 2.0)
+    return module.eval()
+
+
+class TestSerializedUnpoolingBatchNormFold(unittest.TestCase):
+    """The export folds the unpooling batch norms into the linear layers before them."""
+
+    def test_folded_projections_match_the_batch_norm_projections(self) -> None:
+        """
+        Input: an eval-mode SerializedUnpooling (16 input, 8 skip, 12 output channels) with
+        non-trivial batch-norm statistics and affines, and a copy of it with the batch norms
+        folded, both applied to 64 random features per projection in fp32.
+        Expected: the fold is an exact rewrite of the eval-mode batch norm, so each projection
+        computes the same output up to fp32 rounding, and only the copy's parameters change.
+        Check: the outputs of ``proj`` and ``proj_skip`` match within 1e-5, the folded
+        projections hold no BatchNorm1d, and the original's state dict is unchanged.
+        """
+        module = _unpooling_with_trained_batch_norms()
+        state = {key: value.clone() for key, value in module.state_dict().items()}
+        folded = deepcopy(module)
+        folded.fold_batch_norm()
+
+        for name, channels in (("proj", 16), ("proj_skip", 8)):
+            feat = torch.randn(64, channels) * 3.0
+            with torch.no_grad():
+                reference = getattr(module, name)(feat)
+                result = getattr(folded, name)(feat)
+            torch.testing.assert_close(result, reference, rtol=1e-5, atol=1e-5, msg=name)
+            self.assertFalse(
+                any(isinstance(child, nn.BatchNorm1d) for child in getattr(folded, name).modules()),
+                name,
+            )
+        for key, value in module.state_dict().items():
+            self.assertTrue(torch.equal(value, state[key]), key)
+
+    def test_folded_projection_exports_without_batch_normalization(self) -> None:
+        """
+        Input: the ``proj`` projection of an unpooling, exported to ONNX (TorchScript exporter,
+        opset 17, no constant folding, as the deploy configs do) before and after the fold.
+        Expected: the fold removes the batch norm from the graph, so the projection exports as
+        a linear layer followed by the GELU.
+        Check: the unfolded graph has one BatchNormalization node and the folded one has none,
+        and both keep the GELU's Erf.
+        """
+        module = _unpooling_with_trained_batch_norms()
+        counts = {}
+        with tempfile.TemporaryDirectory() as directory:
+            for fold in (False, True):
+                if fold:
+                    module.fold_batch_norm()
+                path = Path(directory) / f"proj_{fold}.onnx"
+                torch.onnx.export(
+                    module.proj,
+                    (torch.randn(5, 16),),
+                    path,
+                    input_names=["feat"],
+                    output_names=["out"],
+                    opset_version=17,
+                    dynamo=False,
+                    do_constant_folding=False,
+                )
+                ops = [node.op_type for node in onnx.load(path).graph.node]
+                counts[fold] = (ops.count("BatchNormalization"), ops.count("Erf"))
+        self.assertEqual(counts[False], (1, 1))
+        self.assertEqual(counts[True], (0, 1))
 
 
 if __name__ == "__main__":
