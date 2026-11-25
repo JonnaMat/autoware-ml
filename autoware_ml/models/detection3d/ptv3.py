@@ -47,6 +47,7 @@ from autoware_ml.models.segmentation3d.ptv3_base import (
     DET3D_HEAD_GRAPH,
     PTv3BaseModel,
     PTv3EncoderExportModule,
+    as_float32,
     stage_voxel_axis_name,
 )
 from autoware_ml.utils.point_cloud.batching import offset_to_batch
@@ -367,7 +368,13 @@ class PTv3Det3DHeadExportModule(nn.Module):
         cluster: torch.Tensor,
         skip_grid_coord: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
-        """Rebuild the coarse pooling link, project to BEV, and run the head."""
+        """Rebuild the coarse pooling link, project to BEV, and run the head.
+
+        The features arrive as fp32 or, with the fp16 interface, as fp16; the head is traced
+        in fp32 either way (see :func:`as_float32`).
+        """
+        skip_feat = as_float32(skip_feat)
+        deepest_feat = as_float32(deepest_feat)
         offset = shape_as_tensor(skip_feat)[:1].to(skip_feat.device)
         parent = Point(feat=skip_feat, grid_coord=skip_grid_coord, offset=offset)
         point = Point(feat=deepest_feat, pooling_parent=parent, pooling_inverse=cluster)
@@ -531,6 +538,7 @@ class PTv3Detection3DModel(PTv3BaseModel):
                 self.EXPORT_ORDER,
                 sparse_shape,
                 serialization_depth,
+                fp16_point_features=self.export_fp16_point_features,
             ).build_deployment_graph(),
             PTv3Det3DHeadExportModule(
                 self.bev_neck,

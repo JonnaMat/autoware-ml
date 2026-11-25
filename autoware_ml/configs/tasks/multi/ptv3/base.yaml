@@ -97,6 +97,9 @@ model:
     [pred_labels, pred_probs, dense_heatmap, query_heatmap_score, query_labels, heatmap, center, height, dim, rot]
   grid_size: ${grid_size}
   point_cloud_range: ${point_cloud_range}
+  # fp16 point_feat_* between the exported encoder and heads (engine I/O dtype change,
+  # see docs/models/ptv3.md)
+  export_fp16_point_features: false
 
   bbox_head:
     _target_: autoware_ml.models.detection3d.heads.transfusions.transfusion_head.TransFusionHead

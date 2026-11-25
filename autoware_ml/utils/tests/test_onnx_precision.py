@@ -119,6 +119,44 @@ def test_fp16_conversion(tmp_path) -> None:
     onnx.checker.check_model(model)
 
 
+def test_fp16_conversion_keeps_fp16_inputs_and_drops_their_casts(tmp_path) -> None:
+    """An fp16 graph input stays fp16, and its fp32 cast of the fp32 export disappears.
+
+    The fp32 export of a module taking fp16 inputs casts them to fp32 first; after the
+    conversion that cast would be fp16->fp16. The consumers read the fp16 input directly.
+    """
+    weight = numpy_helper.from_array(np.eye(4, dtype=np.float32), name="weight")
+    nodes = [
+        helper.make_node("Cast", ["x"], ["x_fp32"], name="to_fp32", to=TensorProto.FLOAT),
+        helper.make_node("MatMul", ["x_fp32", "weight"], ["out"], name="mm0"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "fp16_input",
+        inputs=[
+            helper.make_tensor_value_info("x", TensorProto.FLOAT16, [None, 4]),
+        ],
+        outputs=[
+            helper.make_tensor_value_info("out", TensorProto.FLOAT, [None, 4]),
+        ],
+        initializer=[weight],
+    )
+    onnx_path = tmp_path / "fp16_input.onnx"
+    onnx.save(
+        helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)]), onnx_path.as_posix()
+    )
+
+    model = onnx.load(convert_onnx_precision(onnx_path, OnnxPrecision.FP16).as_posix())
+
+    input_types = {i.name: i.type.tensor_type.elem_type for i in model.graph.input}
+    assert input_types == {"x": TensorProto.FLOAT16}
+    assert all(o.type.tensor_type.elem_type == TensorProto.FLOAT for o in model.graph.output)
+    assert "to_fp32" not in {node.name for node in model.graph.node}
+    mm0 = next(n for n in model.graph.node if n.name == "mm0")
+    assert mm0.input[0] == "x"
+    onnx.checker.check_model(model)
+
+
 def test_fp16_conversion_rejects_subgraphs(tmp_path) -> None:
     """Models with If/Loop/Scan subgraphs are refused: the cast fixups only handle the top level."""
     const = helper.make_node(

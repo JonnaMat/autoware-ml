@@ -80,6 +80,9 @@ model:
     sync_dist: true
   grid_size: ${grid_size}
   point_cloud_range: ${point_cloud_range}
+  # fp16 point_feat_* between the exported encoder and heads (engine I/O dtype change,
+  # see docs/models/ptv3.md)
+  export_fp16_point_features: false
   optimizer: ${optimizer}
   optimizer_group_overrides:
     block:

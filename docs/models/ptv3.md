@@ -149,6 +149,42 @@ autoware-ml deploy \
     deploy.onnx.modules.ptv3_det3d_head.precision=fp32
 ```
 
+### fp16 point features between the encoder and the heads
+
+By default the encoder graph returns its per-stage features `point_feat_*` as fp32 and the
+heads take them as fp32, so every ONNX keeps fp32 float I/O. The fp16 det3d head converts them
+to fp16 first, and a seg3d head engine built with the TensorRT FP16 flag (weakly typed) does
+too. With `model.export_fp16_point_features=true` the export declares them fp16 instead:
+
+- `ptv3_encoder`: each `point_feat_*` output is a `Cast(to=FLOAT16)` of the fp32 feature and
+  is declared `FLOAT16`. The fp32 feature still feeds the next encoder stage.
+- `ptv3_seg3d_head`: each `point_feat_*` input is declared `FLOAT16` and cast to fp32 once
+  (the head graph stays fp32).
+- `ptv3_det3d_head`: each `point_feat_*` input is declared `FLOAT16` and read directly by the
+  fp16 graph; the input cast to fp16 is gone. (With
+  `deploy.onnx.modules.ptv3_det3d_head.precision=fp32` it is cast to fp32 once, as in the
+  seg3d head.)
+
+Names, ranks and sizes of every input and output stay the same; only the exporter-generated
+name of the encoder outputs' channel axis changes (`Cast...` instead of `Add...`). The outputs
+are the fp32 interface's outputs on fp16-rounded features. For the fp16 det3d head and a
+weakly typed fp16 seg3d engine that is what they computed already; an fp32 seg3d engine (as
+the strongly typed TensorRT stage of this repository builds from the fp32 ONNX) now sees
+fp16-rounded features.
+
+```bash
+autoware-ml deploy \
+    --config-name multi/ptv3/nuscenes/voxel005_b16_100e_nuscenes_51m \
+    --weights <checkpoint> \
+    model.export_fp16_point_features=true
+```
+
+This changes the engines' I/O dtypes: a runtime that chains the engines has to pass fp16
+buffers from the encoder to the heads (2 bytes per value). Engines exported with and without
+the option cannot be mixed, and a buffer of the wrong dtype bound by raw device pointer gives
+wrong results without an error, so a runtime should check each `point_feat_*` dtype of the
+engine at load time. Input files for benchmarking the heads have to be fp16 as well.
+
 The exported ONNX model returns both `pred_labels` and `pred_probs`. The
 probability output is produced by a final softmax layer, while training and
 evaluation continue to use logits inside the Lightning model.

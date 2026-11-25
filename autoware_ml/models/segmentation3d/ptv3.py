@@ -172,6 +172,7 @@ class PTv3Segmentation3DModel(PTv3BaseModel):
                 self.EXPORT_ORDER,
                 sparse_shape,
                 serialization_depth,
+                fp16_point_features=self.export_fp16_point_features,
             ).build_deployment_graph(),
             PTv3Seg3DHeadExportModule(
                 self.seg3d_head, self.EXPORT_ORDER, sparse_shape, self.encoder.stride

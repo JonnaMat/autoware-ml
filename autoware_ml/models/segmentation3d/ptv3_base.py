@@ -22,7 +22,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from jaxtyping import Float32, Int32, Int64
+from jaxtyping import Float, Float32, Int32, Int64
 from torch.onnx.operators import shape_as_tensor
 
 from autoware_ml.dataclasses.geometry.voxels import VoxelsData
@@ -139,6 +139,7 @@ class PTv3BaseModel(ModuleBaseModel):
         point_cloud_range: Sequence[float] | None,
         log_dict_configs: LogDictConfigs,
         freeze_encoder: bool = False,
+        export_fp16_point_features: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the PTv3 base model.
@@ -153,6 +154,10 @@ class PTv3BaseModel(ModuleBaseModel):
             log_dict_configs: Logging configuration for training and validation.
             freeze_encoder: When ``True``, the encoder is permanently kept
                 in eval mode with its parameters frozen.
+            export_fp16_point_features: When ``True``, the exported graphs pass the
+                per-stage features ``point_feat_*`` between the encoder and the heads as
+                fp16 instead of fp32 (see :class:`PTv3EncoderExportModule`). This changes
+                the graph I/O dtypes the runtime binds.
             **kwargs: Keyword arguments forwarded to :class:`ModuleBaseModel` (and
                 further up the MRO chain).
         """
@@ -171,6 +176,7 @@ class PTv3BaseModel(ModuleBaseModel):
         if self.grid_size is not None and self.point_cloud_range is not None:
             validate_serialization_geometry(encoder, self.grid_size, self.point_cloud_range)
         self.freeze_encoder = bool(freeze_encoder)
+        self.export_fp16_point_features = bool(export_fp16_point_features)
         if self.freeze_encoder:
             self.encoder.requires_grad_(False)
             self.encoder.eval()
@@ -488,6 +494,16 @@ def _serialized_pooling_dynamic_axis(input_name: str) -> dict[int, str]:
     return {0: f"{stage_prefix}_out_voxels"}
 
 
+def as_float32(feat: torch.Tensor) -> torch.Tensor:
+    """Return a stage feature as fp32 for a head traced in fp32.
+
+    The features arrive as fp32 or, with the fp16 interface, as fp16. Only an fp16 feature is
+    cast: the tracer records ``.float()`` as a ``Cast`` node even on an fp32 tensor, and the
+    fp32 interface keeps its graphs unchanged.
+    """
+    return feat if feat.dtype == torch.float32 else feat.float()
+
+
 def stage_voxel_axis_name(stage_index: int) -> str:
     """Return the dynamic-axis name for the voxel count of one encoder stage."""
     if stage_index == 0:
@@ -591,6 +607,7 @@ class PTv3EncoderExportModule(nn.Module):
         serialization_orders: Sequence[str],
         sparse_shape: Int64[torch.Tensor, " 3"],
         serialized_depth: Int64[torch.Tensor, ""],
+        fp16_point_features: bool = False,
     ) -> None:
         """Initialize the encoder export module.
 
@@ -600,9 +617,13 @@ class PTv3EncoderExportModule(nn.Module):
             serialization_orders: Space-filling curves the export serializes the voxels along.
             sparse_shape: Static sparse shape baked at export time.
             serialized_depth: Serialization depth baked at export time.
+            fp16_point_features: Return the per-stage features as fp16. The heads compute
+                in fp16 from these features anyway, so an fp16 interface drops the fp32 copy
+                the encoder writes and the cast back to fp16 each head runs first.
         """
         super().__init__()
         self.encoder = encoder.prepare_for_export(serialization_orders)
+        self.fp16_point_features = fp16_point_features
         self.voxel_encoder = voxel_encoder
         self.register_buffer("_sparse_shape", sparse_shape.to(dtype=torch.long), persistent=False)
         self.register_buffer("_serialized_depth", serialized_depth, persistent=False)
@@ -615,7 +636,7 @@ class PTv3EncoderExportModule(nn.Module):
         patch_order: Int64[torch.Tensor, "num_orders padded_voxels"],
         serialized_inverse: Int64[torch.Tensor, "num_orders num_voxels"],
         *serialized_pooling_inputs: GraphTensor,
-    ) -> tuple[Float32[torch.Tensor, "stage_voxels stage_channels"], ...]:
+    ) -> tuple[Float[torch.Tensor, "stage_voxels stage_channels"], ...]:
         """Run the encoder on serialized voxels and return the per-stage features.
 
         Args:
@@ -628,7 +649,8 @@ class PTv3EncoderExportModule(nn.Module):
                 stage by stage.
 
         Returns:
-            The point features of every stage, finest to deepest.
+            The point features of every stage, finest to deepest; fp16 with
+            ``fp16_point_features``, fp32 otherwise.
         """
         feat = self.voxel_encoder(voxels, num_points_per_voxel)
         point = self.encoder.export_forward(
@@ -646,7 +668,11 @@ class PTv3EncoderExportModule(nn.Module):
                 "sparse_shape": self._sparse_shape,
             }
         )
-        return tuple(stage.feat for stage in collect_encoder_stage_points(point))
+        feats = tuple(stage.feat for stage in collect_encoder_stage_points(point))
+        if self.fp16_point_features:
+            # A cast per output: the fp32 stage features stay the input of the next stage.
+            feats = tuple(feat.to(torch.float16) for feat in feats)
+        return feats
 
     def build_deployment_graph(self) -> DeploymentGraph:
         """Declare this module as the ``ptv3_encoder`` graph.
@@ -794,12 +820,12 @@ class PTv3Seg3DHeadExportModule(nn.Module):
         """Decode per-stage features and return labels and class probabilities.
 
         Args:
-            tensors: ``stage_count`` per-stage feature tensors, then
+            tensors: ``stage_count`` per-stage feature tensors (fp32 or fp16), then
                 ``stage_count - 1`` pooling cluster tensors, then the
                 per-block-stage serialization tensors in the order defined by
                 :func:`seg3d_head_export_input_names`.
         """
-        stage_feats = tensors[: self.stage_count]
+        stage_feats = [as_float32(feat) for feat in tensors[: self.stage_count]]
         clusters = tensors[self.stage_count : 2 * self.stage_count - 1]
         extras = list(tensors[2 * self.stage_count - 1 :])
 

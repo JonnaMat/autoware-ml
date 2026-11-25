@@ -16,12 +16,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
+import onnx
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from autoware_ml.dataclasses.batch.segmentation3d import Segmentation3DGTBatch
 from autoware_ml.dataclasses.geometry.voxels import VoxelsData
@@ -56,12 +58,15 @@ from autoware_ml.models.segmentation3d.encoders.voxel import SweepSplitVoxelFeat
 from autoware_ml.models.segmentation3d.ptv3_base import (
     DET3D_HEAD_GRAPH,
     ENCODER_GRAPH,
+    PTv3BaseModel,
     SEG3D_HEAD_GRAPH,
     seg3d_head_export_input_names,
 )
 from autoware_ml.ops.spconv.availability import IS_SPCONV_AVAILABLE
 from autoware_ml.preprocessing.data_preprocessor import DataPreprocessor
 from autoware_ml.utils.checkpoints import apply_matching_weights
+from autoware_ml.utils.deploy import export_to_onnx
+from autoware_ml.utils.onnx_precision import OnnxPrecision, convert_onnx_precision
 
 JOINT_EXPORT_OUTPUT_NAMES = [
     "pred_labels",
@@ -269,11 +274,15 @@ def _save_detection3d_checkpoint(
     return checkpoint_path
 
 
-def _build_det3d_seg3d_model(patch_sizes: Sequence[int] = (4, 4)) -> PTv3Det3DSeg3DModel:
+def _build_det3d_seg3d_model(
+    patch_sizes: Sequence[int] = (4, 4), export_fp16_point_features: bool | None = None
+) -> PTv3Det3DSeg3DModel:
     """Return a small joint PTv3 model over the test encoder.
 
     Args:
         patch_sizes: Attention window of every level, the input level first.
+        export_fp16_point_features: Export the encoder-to-head features as fp16; ``None``
+            leaves the model's default.
 
     Returns:
         The joint model on the CPU.
@@ -289,6 +298,11 @@ def _build_det3d_seg3d_model(patch_sizes: Sequence[int] = (4, 4)) -> PTv3Det3DSe
         export_output_names=JOINT_EXPORT_OUTPUT_NAMES,
         grid_size=1.0,
         point_cloud_range=[0.0, 0.0, -2.0, 8.0, 8.0, 2.0],
+        **(
+            {}
+            if export_fp16_point_features is None
+            else {"export_fp16_point_features": export_fp16_point_features}
+        ),
     )
 
 
@@ -428,3 +442,185 @@ def test_ptv3_det3d_seg3d_seg3d_logits_invariant_to_det3d_branch_pass() -> None:
         seg3d_only_logits = model.seg3d_head(point)
 
     torch.testing.assert_close(joint_logits, seg3d_only_logits)
+
+
+def _is_point_feature(name: str) -> bool:
+    """Return whether a graph tensor is one of the per-stage encoder features."""
+    return name.startswith("point_feat_")
+
+
+def _cast_target(node: onnx.NodeProto) -> int:
+    """Return the ``to`` dtype of a ``Cast`` node."""
+    return next(attribute.i for attribute in node.attribute if attribute.name == "to")
+
+
+@pytest.mark.parametrize(
+    "build_model", [_build_det3d_seg3d_model, build_seg3d_model, build_trans_model]
+)
+def test_ptv3_export_fp16_point_features_is_off_by_default(
+    build_model: Callable[[], PTv3BaseModel],
+) -> None:
+    """Test that every PTv3 model exports fp32 features unless it opts in.
+
+    Input: the joint, the segmentation and the detection model with their default
+        ``export_fp16_point_features``, then with it set.
+    Expected: off by default (the fp16 interface changes the engines' I/O dtypes); once set,
+        the declared encoder graph returns fp16 features.
+    Check: the model attribute and the encoder graph module's ``fp16_point_features``.
+    """
+    model = build_model()
+    assert model.export_fp16_point_features is False
+    graphs = {graph.name: graph for graph in model.deployment_graphs()}
+    assert graphs[ENCODER_GRAPH].module.fp16_point_features is False
+    model.export_fp16_point_features = True
+    graphs = {graph.name: graph for graph in model.deployment_graphs()}
+    assert graphs[ENCODER_GRAPH].module.fp16_point_features is True
+
+
+@pytest.mark.skipif(
+    not IS_SPCONV_AVAILABLE or not torch.cuda.is_available(),
+    reason="PTv3 sparse-convolution export tests require CUDA spconv",
+)
+def test_ptv3_det3d_seg3d_fp16_point_features_match_fp16_rounded_fp32_features() -> None:
+    """Test that the fp16 interface is the fp32 deployment with fp16-rounded features.
+
+    Input: one joint model exported with and without ``export_fp16_point_features``, the same
+        weights, one batch.
+    Expected: the encoder returns exactly fp16(the fp32 features); each head fed the fp16
+        features returns exactly what it returns on the fp16-rounded fp32 features; every other
+        tensor is unchanged.
+    Check: the trace args and outputs of the derived specs, bitwise.
+    """
+    cuda = torch.device("cuda")
+    batch = build_inputs(device=cuda)
+    torch.manual_seed(0)
+    reference = _build_det3d_seg3d_model().cuda().eval()
+    model = _build_det3d_seg3d_model(export_fp16_point_features=True).cuda().eval()
+    model.load_state_dict(reference.state_dict())
+
+    reference_specs = reference.build_export_specs(batch)
+    specs = model.build_export_specs(batch)
+    with torch.no_grad():
+        reference_feats = reference_specs[ENCODER_GRAPH].module(
+            *reference_specs[ENCODER_GRAPH].args
+        )
+        feats = specs[ENCODER_GRAPH].module(*specs[ENCODER_GRAPH].args)
+        assert all(feat.dtype == torch.float16 for feat in feats)
+        for feat, reference_feat in zip(feats, reference_feats, strict=True):
+            assert reference_feat.dtype == torch.float32
+            assert torch.equal(feat, reference_feat.half())
+
+        for graph in (SEG3D_HEAD_GRAPH, DET3D_HEAD_GRAPH):
+            spec, reference_spec = specs[graph], reference_specs[graph]
+            assert spec.input_names == reference_spec.input_names
+            rounded_args = []
+            for name, arg, reference_arg in zip(
+                spec.input_names, spec.args, reference_spec.args, strict=True
+            ):
+                if _is_point_feature(name):
+                    assert arg.dtype == torch.float16, (graph, name)
+                    assert torch.equal(arg, reference_arg.half()), (graph, name)
+                    rounded_args.append(reference_arg.half().float())
+                else:
+                    assert torch.equal(arg, reference_arg), (graph, name)
+                    rounded_args.append(reference_arg)
+            outputs = spec.module(*spec.args)
+            reference_outputs = reference_spec.module(*rounded_args)
+            for name, output, reference_output in zip(
+                spec.output_names, outputs, reference_outputs, strict=True
+            ):
+                assert torch.equal(output, reference_output), (graph, name)
+
+
+@pytest.mark.skipif(
+    not IS_SPCONV_AVAILABLE or not torch.cuda.is_available(),
+    reason="PTv3 sparse-convolution export tests require CUDA spconv",
+)
+def test_ptv3_det3d_seg3d_fp16_point_features_onnx_interface(tmp_path: Path) -> None:
+    """Test that the exported graphs declare the point features fp16 and nothing else changes.
+
+    Input: one joint model exported to ONNX with and without ``export_fp16_point_features``;
+        the det3d head also converted to fp16 as the shipped configs do.
+    Expected: the encoder's ``point_feat_*`` outputs and the heads' ``point_feat_*`` inputs are
+        FLOAT16, every other input and output keeps its name, dtype and shape; the fp16 det3d
+        head reads its fp16 inputs directly (no cast left on them), the fp32 seg3d head casts
+        them to fp32 once; without the option no head casts its fp32 features.
+    Check: the ONNX value infos and the consumers of the ``point_feat_*`` inputs.
+    """
+    cuda = torch.device("cuda")
+    batch = build_inputs(device=cuda)
+    onnx_cfg = OmegaConf.create(
+        {"opset_version": 17, "dynamo": False, "do_constant_folding": False}
+    )
+
+    def export(model: PTv3Det3DSeg3DModel, directory: Path) -> dict[str, onnx.ModelProto]:
+        """Export every graph; the det3d head also before its fp16 conversion (``*_fp32``)."""
+        directory.mkdir()
+        models = {}
+        for name, spec in model.build_export_specs(batch).items():
+            path = directory / f"{name}.onnx"
+            export_to_onnx(spec, onnx_cfg, path)
+            if name == DET3D_HEAD_GRAPH:
+                models[f"{name}_fp32"] = onnx.load(path.as_posix())
+                path = convert_onnx_precision(path, OnnxPrecision.FP16)
+            models[name] = onnx.load(path.as_posix())
+        return models
+
+    def io(model: onnx.ModelProto) -> list[tuple[str, int, list[int | str]]]:
+        # The exporter names an axis it cannot infer after the op producing the tensor
+        # (``<Op><tensor>_dim_<axis>``; the cast changes ``<Op>``), so only the declared
+        # dynamic axes and the static sizes are compared by value.
+        def dim(value: onnx.ValueInfoProto, axis: int, size: onnx.TensorShapeProto.Dimension):
+            if size.dim_param.endswith(f"{value.name}_dim_{axis}"):
+                return "?"
+            return size.dim_param or size.dim_value
+
+        return [
+            (
+                value.name,
+                value.type.tensor_type.elem_type,
+                [dim(value, i, d) for i, d in enumerate(value.type.tensor_type.shape.dim)],
+            )
+            for value in [*model.graph.input, *model.graph.output]
+        ]
+
+    torch.manual_seed(0)
+    reference_model = _build_det3d_seg3d_model().cuda().eval()
+    fp16_model = _build_det3d_seg3d_model(export_fp16_point_features=True).cuda().eval()
+    fp16_model.load_state_dict(reference_model.state_dict())
+    reference = export(reference_model, tmp_path / "fp32")
+    exported = export(fp16_model, tmp_path / "fp16")
+
+    for graph in (ENCODER_GRAPH, SEG3D_HEAD_GRAPH, DET3D_HEAD_GRAPH):
+        expected = [
+            (name, onnx.TensorProto.FLOAT16 if _is_point_feature(name) else dtype, shape)
+            for name, dtype, shape in io(reference[graph])
+        ]
+        assert io(exported[graph]) == expected, graph
+        point_feats = [name for name, _, _ in expected if _is_point_feature(name)]
+        assert point_feats, graph
+        for name, dtype, _ in io(reference[graph]):
+            if _is_point_feature(name):
+                assert dtype == onnx.TensorProto.FLOAT, (graph, name)
+
+    def consumers(model: onnx.ModelProto, name: str) -> list[onnx.NodeProto]:
+        return [node for node in model.graph.node if name in node.input]
+
+    # The fp32 interface keeps its graphs: no cast is traced on an fp32 feature (checked on the
+    # det3d head before its fp16 conversion, which adds casts to fp16 of its own).
+    for graph in (SEG3D_HEAD_GRAPH, f"{DET3D_HEAD_GRAPH}_fp32"):
+        for value in reference[graph].graph.input:
+            if _is_point_feature(value.name):
+                nodes = consumers(reference[graph], value.name)
+                assert nodes, (graph, value.name)
+                assert all(node.op_type != "Cast" for node in nodes), (graph, value.name)
+
+    det3d_inputs = [i.name for i in exported[DET3D_HEAD_GRAPH].graph.input]
+    for name in filter(_is_point_feature, det3d_inputs):
+        nodes = consumers(exported[DET3D_HEAD_GRAPH], name)
+        assert nodes and all(node.op_type != "Cast" for node in nodes), name
+    seg3d_inputs = [i.name for i in exported[SEG3D_HEAD_GRAPH].graph.input]
+    for name in filter(_is_point_feature, seg3d_inputs):
+        (node,) = consumers(exported[SEG3D_HEAD_GRAPH], name)
+        assert node.op_type == "Cast", name
+        assert _cast_target(node) == onnx.TensorProto.FLOAT, name

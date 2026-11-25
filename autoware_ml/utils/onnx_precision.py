@@ -18,8 +18,10 @@
 The TensorRT stage always builds strongly typed, so those dtypes are what the
 engine uses: the exported ONNX alone decides the engine's numerics.
 
-All float network inputs/outputs always stay FP32, so inference code works
-with all model precisions without interface changes.
+The fp32 float network inputs/outputs stay FP32, so inference code works
+with all model precisions without interface changes. Inputs and outputs the
+module itself exports as fp16 (e.g. PTv3's optional fp16 ``point_feat_*``
+interface) stay fp16.
 """
 
 from __future__ import annotations
@@ -111,21 +113,32 @@ def _convert_to_fp16(onnx_path: Path) -> Path:
     # The op block list must be empty: custom plugin ops negotiate their own precisions and
     # support fp16 I/O natively, and the default block list creates fp32 islands whose boundary
     # casts the converter places incorrectly around ops it cannot shape-infer.
+    # The converter refuses a model holding any fp16 tensor (graph I/O, value info, initializer)
+    # or Cast(to=FLOAT16) as already converted. A module that exports fp16 I/O itself (PTv3's
+    # optional fp16 point_feat_* interface) traces those casts but is an fp32 model inside, so
+    # skip that check for it; the converter leaves fp16 I/O as is.
+    has_fp16_io = any(
+        value.type.tensor_type.elem_type == onnx.TensorProto.FLOAT16
+        for value in [*model.graph.input, *model.graph.output]
+    )
     converted = float16.convert_float_to_float16(
         model,
         keep_io_types=True,
         op_block_list=[],
         disable_shape_infer=True,  # custom plugin ops break ONNX shape inference
+        check_fp16_ready=not has_fp16_io,
     )
 
     n_rewired = _rewire_dual_use_outputs(converted)
     n_recast = _retarget_stray_float_casts(converted)
+    n_dropped = _drop_identity_input_casts(converted)
     logger.info(
-        "Converted %s to fp16 with fp32 graph I/O (rewired %d dual-use output consumer(s), "
-        "retargeted %d pre-existing float cast(s))",
+        "Converted %s to fp16, fp32 graph I/O kept fp32 (rewired %d dual-use output consumer(s), "
+        "retargeted %d pre-existing float cast(s), dropped %d identity input cast(s))",
         onnx_path,
         n_rewired,
         n_recast,
+        n_dropped,
     )
 
     onnx.save(converted, onnx_path.as_posix())
@@ -188,3 +201,38 @@ def _retarget_stray_float_casts(model: Any) -> int:
                     value = onnx.numpy_helper.to_array(attribute.t)
                     attribute.t.CopyFrom(onnx.numpy_helper.from_array(value.astype("float16")))
     return n_recast
+
+
+def _drop_identity_input_casts(model: Any) -> int:
+    """Remove fp16->fp16 casts of fp16 graph inputs.
+
+    A module exported with fp16 inputs casts them to fp32 for the fp32 trace; after the
+    conversion (``_retarget_stray_float_casts``) that cast is fp16->fp16. Its consumers read
+    the graph input directly instead. Casts that produce a graph output stay.
+    """
+    fp16_inputs = {
+        graph_input.name
+        for graph_input in model.graph.input
+        if graph_input.type.tensor_type.elem_type == onnx.TensorProto.FLOAT16
+    }
+    graph_outputs = {output.name for output in model.graph.output}
+    identity_casts = [
+        node
+        for node in model.graph.node
+        if node.op_type == "Cast"
+        and node.input[0] in fp16_inputs
+        and node.output[0] not in graph_outputs
+        and any(
+            attribute.name == "to" and attribute.i == onnx.TensorProto.FLOAT16
+            for attribute in node.attribute
+        )
+    ]
+    for cast in identity_casts:
+        for node in model.graph.node:
+            for index, node_input in enumerate(node.input):
+                if node_input == cast.output[0]:
+                    node.input[index] = cast.input[0]
+        model.graph.node.remove(cast)
+        for value_info in [v for v in model.graph.value_info if v.name == cast.output[0]]:
+            model.graph.value_info.remove(value_info)
+    return len(identity_casts)
