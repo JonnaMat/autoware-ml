@@ -1127,20 +1127,32 @@ class SerializedUnpooling(PointModule):
             nn.BatchNorm1d(out_channels, eps=1e-3, momentum=0.01),
             nn.GELU(),
         )
+        # Set on an export copy whose next layer is linear (see PTv3Seg3DDecoderHead).
+        self.defer_fusion = False
 
     def forward(self, point: Point) -> Point:
         """Unpool one hierarchy level and fuse skip features.
+
+        With ``defer_fusion`` set, the parent keeps the projected skip features as ``feat`` and
+        carries the projected coarse features and the inverse as ``unpooling_feat`` and
+        ``unpooling_inverse``, so the module after it can fuse them; a linear layer can then
+        run before the gather.
 
         Args:
             point: Point container at the coarse hierarchy level.
 
         Returns:
-            Point container fused with skip features.
+            Parent-level point container, fused with the skip features unless
+            ``defer_fusion`` is set.
         """
         parent = point.pop("pooling_parent")
         inverse = point.pop("pooling_inverse")
         point = self.proj(point)
         parent = self.proj_skip(parent)
+        if self.defer_fusion:
+            parent["unpooling_feat"] = point.feat
+            parent["unpooling_inverse"] = inverse
+            return parent
         parent.feat = parent.feat + point.feat[inverse]
         return parent
 

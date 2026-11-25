@@ -198,6 +198,15 @@ class PTv3Seg3DDecoderHead(nn.Module):
             finest (input) hierarchy level.
         """
         decoded = self.dec(point)
+        if "unpooling_feat" in decoded:
+            # The finest unpooling left its fusion to the classifier (defer_fusion, export only):
+            # (skip + coarse[inverse]) W^T + b == (skip W^T + b) + (coarse W^T)[inverse], as a
+            # linear map distributes over the sum and commutes with a row gather. The gather
+            # then moves num_classes channels instead of the decoder width.
+            coarse_logits = nn.functional.linear(
+                decoded.pop("unpooling_feat"), self.classifier.weight
+            )
+            return self.classifier(decoded.feat) + coarse_logits[decoded.pop("unpooling_inverse")]
         return self.classifier(decoded.feat)
 
     def loss(
@@ -241,6 +250,10 @@ class PTv3Seg3DDecoderHead(nn.Module):
     def prepare_for_export(self, order: Sequence[str]) -> PTv3Seg3DDecoderHead:
         """Return an isolated head copy configured for ONNX export.
 
+        When the finest decoder stage has no blocks, the copy applies the classifier before
+        the gather of that stage's unpooling, so the gather moves ``num_classes`` channels
+        instead of the decoder width.
+
         Args:
             order: Serialization orders used by the export graph.
 
@@ -250,6 +263,8 @@ class PTv3Seg3DDecoderHead(nn.Module):
         export_head = deepcopy_without_flash(self)
         export_head.set_serialization_order(order)
         prepare_point_module_for_export(export_head)
+        # Only without blocks on the finest stage is the classifier the next layer.
+        export_head.dec.dec0.up.defer_fusion = export_head.dec_depths[0] == 0
         return export_head
 
 
