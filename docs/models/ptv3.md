@@ -149,6 +149,46 @@ autoware-ml deploy \
     deploy.onnx.modules.ptv3_det3d_head.precision=fp32
 ```
 
+### Submanifold rulebooks from the encoder to the seg3d head
+
+The first block of a decoder stage with blocks starts with a submanifold convolution, which
+builds its rulebook (`autoware::GetIndicePairsImplicitGemm`) from the stage's voxel
+coordinates. The encoder stage of the same level has built the same rulebook already: same
+voxels in the same order, same sparse shape, same convolution attributes. With
+`model.export_seg3d_rulebook_handoff=true` the export passes it on instead of building it twice
+(default `false`):
+
+- `ptv3_encoder`: for every such stage `k`, the outputs 1, 2 and 3 of its stage-`k`
+  `GetIndicePairsImplicitGemm` (the ones `ImplicitGemm` reads) become graph outputs
+  `rulebook_enc{k}_pairs`, `rulebook_enc{k}_point_mask` and `rulebook_enc{k}_mask_argsort`
+  (`INT32`), after the `point_feat_*` outputs. The encoder computes exactly as before.
+- `ptv3_seg3d_head`: the same tensors are inputs, after the other inputs; the stage's
+  `GetIndicePairsImplicitGemm` and the coordinate preparation that fed it are gone. A stage
+  whose attention reads no coordinates (no RoPE and no relative position encoding) no longer
+  takes its `grid_coord` input (`serialized_pooling_{k-1}_grid_coord`, or `grid_coord` for
+  stage 0).
+- `ptv3_det3d_head`: unchanged.
+
+For the PTv3 configs (`dec_depths: [0, 0, 1, 1]`) these are stages 2 and 3: six tensors, and
+`serialized_pooling_1_grid_coord` and `serialized_pooling_2_grid_coord` leave the seg3d head's
+inputs. The LitePT decoder has no convolution, so its export does not change. The head's
+outputs are the same as when it builds the rulebooks itself.
+
+```bash
+autoware-ml deploy \
+    --config-name multi/ptv3/nuscenes/voxel005_b16_100e_nuscenes_51m \
+    --weights <checkpoint> \
+    model.export_seg3d_rulebook_handoff=true
+```
+
+This changes the engines' interface: a runtime that chains the engines has to pass the six
+`INT32` tensors from the encoder's outputs to the seg3d head's inputs unchanged. They are in
+the sparse-convolution plugin's internal layout (the plugin pads the pairs, so their sizes are
+not the PyTorch export's), and every axis of them is declared dynamic: the runtime takes each
+size from the encoder engine's output. A change of that layout in the plugin, or another
+sparse-convolution backend, needs its own variant of the interface. Engines exported with and
+without the option cannot be mixed.
+
 The exported ONNX model returns both `pred_labels` and `pred_probs`. The
 probability output is produced by a final softmax layer, while training and
 evaluation continue to use logits inside the Lightning model.
@@ -238,7 +278,10 @@ The split export produces one graph per `deploy.onnx.modules` entry:
   `serialized_pooling_{i-1}_grid_coord` (stage 0 instead takes the base
   `patch_order`, `serialized_inverse` and `grid_coord`). The rule is implemented once in
   `seg3d_head_export_input_names` and must be mirrored by deployment consumers
-  from the artifact's `dec_depths`.
+  from the artifact's `dec_depths`. With `model.export_seg3d_rulebook_handoff=true` the
+  encoder adds the `rulebook_enc{k}_*` outputs and the seg3d head takes them as its last
+  inputs (see
+  [Submanifold rulebooks from the encoder to the seg3d head](#submanifold-rulebooks-from-the-encoder-to-the-seg3d-head)).
 - `det3d_head` - consumes `point_feat_{S-2}`, `point_feat_{S-1}`,
   `pooling_cluster_{S-2}`, and `point_grid_coord_{S-2}` and outputs the
   detection head tensors.

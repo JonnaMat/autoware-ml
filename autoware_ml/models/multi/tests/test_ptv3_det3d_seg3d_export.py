@@ -57,6 +57,7 @@ from autoware_ml.models.segmentation3d.ptv3_base import (
     DET3D_HEAD_GRAPH,
     ENCODER_GRAPH,
     SEG3D_HEAD_GRAPH,
+    rulebook_names,
     seg3d_head_export_input_names,
 )
 from autoware_ml.ops.spconv.availability import IS_SPCONV_AVAILABLE
@@ -427,3 +428,56 @@ def test_ptv3_det3d_seg3d_seg3d_logits_invariant_to_det3d_branch_pass() -> None:
         seg3d_only_logits = model.seg3d_head(point)
 
     torch.testing.assert_close(joint_logits, seg3d_only_logits)
+
+
+def test_ptv3_det3d_seg3d_rulebook_handoff_leaves_the_det3d_head_unchanged() -> None:
+    """Test that the joint model hands the rulebook to the seg3d head only.
+
+    Input: the joint model's declared graphs without and with ``export_seg3d_rulebook_handoff``.
+    Expected: off by default; once set, the encoder adds the stage-0 rulebook outputs, the seg3d
+        head takes them instead of ``grid_coord``, and the det3d head graph is unchanged.
+    Check: the graphs' input and output names.
+    """
+    model = _build_det3d_seg3d_model()
+    assert model.export_seg3d_rulebook_handoff is False
+
+    def io() -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+        return {
+            graph.name: (tuple(graph.input_names), tuple(graph.output_names))
+            for graph in model.deployment_graphs()
+        }
+
+    reference = io()
+    model.export_seg3d_rulebook_handoff = True
+    graphs = io()
+    rulebooks = tuple(rulebook_names([0]))
+    assert graphs[DET3D_HEAD_GRAPH] == reference[DET3D_HEAD_GRAPH]
+    assert graphs[ENCODER_GRAPH] == (
+        reference[ENCODER_GRAPH][0],
+        reference[ENCODER_GRAPH][1] + rulebooks,
+    )
+    head_inputs, head_outputs = reference[SEG3D_HEAD_GRAPH]
+    assert graphs[SEG3D_HEAD_GRAPH] == (
+        tuple(name for name in head_inputs if name != "grid_coord") + rulebooks,
+        head_outputs,
+    )
+
+
+@pytest.mark.skipif(
+    not IS_SPCONV_AVAILABLE or not torch.cuda.is_available(),
+    reason="PTv3 sparse-convolution export tests require CUDA spconv",
+)
+def test_ptv3_det3d_seg3d_deployment_with_rulebook_handoff_reproduces_forward() -> None:
+    """Test that the joint deployment handing the rulebook over reproduces forward().
+
+    Input: a joint model with ``export_seg3d_rulebook_handoff`` whose window at every level is
+        that level's voxel count, and one batch.
+    Expected: every segmentation and detection output of the deployment matches forward()'s
+        to 1e-5.
+    Check: assert_deployment_reproduces_forward().
+    """
+    cuda = torch.device("cuda")
+    batch = build_inputs(device=cuda)
+    model = _build_det3d_seg3d_model(whole_level_patch_sizes(batch)).cuda().eval()
+    model.export_seg3d_rulebook_handoff = True
+    assert_deployment_reproduces_forward(model, batch, cuda, _joint_tensors, rtol=1e-5, atol=1e-5)

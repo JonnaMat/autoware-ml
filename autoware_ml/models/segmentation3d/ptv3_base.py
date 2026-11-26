@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import fields
 from typing import Any
 
@@ -73,6 +73,17 @@ SEG3D_HEAD_GRAPH = "ptv3_seg3d_head"
 DET3D_HEAD_GRAPH = "ptv3_det3d_head"
 #: Per-voxel argmax labels and softmax scores.
 SEG3D_HEAD_OUTPUT_NAMES = ("pred_labels", "pred_probs")
+#: The rulebook the encoder hands to the seg3d head for a stage (``export_seg3d_rulebook_handoff``):
+#: the rulebook outputs of the stage's first submanifold convolution that its convolutions read,
+#: as ``(graph tensor suffix, spconv ImplicitGemmIndiceData attribute, rank)``. They are in the
+#: sparse-convolution plugin's internal layout, which differs from spconv's in PyTorch (the
+#: plugin pads the pairs), so every axis is declared dynamic. Another rulebook op only changes
+#: this table.
+RULEBOOK_HANDOFF_FIELDS = (
+    ("pairs", "pair_fwd", 2),
+    ("point_mask", "pair_mask_fwd_splits", 2),
+    ("mask_argsort", "mask_argsort_fwd_splits", 1),
+)
 
 
 def validate_serialization_geometry(
@@ -139,6 +150,7 @@ class PTv3BaseModel(ModuleBaseModel):
         point_cloud_range: Sequence[float] | None,
         log_dict_configs: LogDictConfigs,
         freeze_encoder: bool = False,
+        export_seg3d_rulebook_handoff: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the PTv3 base model.
@@ -153,6 +165,10 @@ class PTv3BaseModel(ModuleBaseModel):
             log_dict_configs: Logging configuration for training and validation.
             freeze_encoder: When ``True``, the encoder is permanently kept
                 in eval mode with its parameters frozen.
+            export_seg3d_rulebook_handoff: When ``True``, the exported encoder graph returns
+                the submanifold-convolution rulebooks the seg3d head would otherwise rebuild,
+                and the head takes them as inputs (see :func:`seg3d_rulebook_handoff_stages`).
+                This changes the graph I/O the runtime binds.
             **kwargs: Keyword arguments forwarded to :class:`ModuleBaseModel` (and
                 further up the MRO chain).
         """
@@ -171,6 +187,7 @@ class PTv3BaseModel(ModuleBaseModel):
         if self.grid_size is not None and self.point_cloud_range is not None:
             validate_serialization_geometry(encoder, self.grid_size, self.point_cloud_range)
         self.freeze_encoder = bool(freeze_encoder)
+        self.export_seg3d_rulebook_handoff = bool(export_seg3d_rulebook_handoff)
         if self.freeze_encoder:
             self.encoder.requires_grad_(False)
             self.encoder.eval()
@@ -315,6 +332,18 @@ class PTv3BaseModel(ModuleBaseModel):
                 "'max_voxels' and 'eval_max_voxels' of the data preprocessing so every voxel "
                 "is kept."
             )
+
+    def export_rulebook_stages(self) -> tuple[int, ...]:
+        """Return the stages whose rulebook the export hands from the encoder to the seg3d head.
+
+        Returns:
+            The hand-off stages, none unless ``export_seg3d_rulebook_handoff`` is set and the
+            model has a seg3d head.
+        """
+        seg3d_head = getattr(self, "seg3d_head", None)
+        if not self.export_seg3d_rulebook_handoff or seg3d_head is None:
+            return ()
+        return seg3d_rulebook_handoff_stages(self.encoder, seg3d_head)
 
     def compute_export_geometry(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute sparse shape and serialization depth for export.
@@ -550,6 +579,162 @@ def build_ptv3_encoder_dynamic_axes(
     return dynamic_axes
 
 
+def stage_submanifold_conv(stage: nn.Module) -> nn.Module | None:
+    """Return the submanifold convolution that builds a stage's rulebook.
+
+    The first block with a positional-encoding convolution builds the rulebook under its
+    indice key; the later blocks of the stage reuse it.
+
+    Args:
+        stage: One encoder ``enc{i}`` or decoder ``dec{i}`` stage.
+
+    Returns:
+        That convolution, or ``None`` when no block of the stage has one.
+    """
+    for block in stage.children():
+        if isinstance(block, Block) and block.cpe is not None:
+            return next(iter(block.cpe.children()))
+    return None
+
+
+def stage_attention_reads_grid_coord(stage: nn.Module) -> bool:
+    """Return whether an attention block of the stage reads the voxel coordinates.
+
+    Rotary and relative position encodings read ``grid_coord``; plain attention does not.
+
+    Args:
+        stage: One decoder ``dec{i}`` stage.
+    """
+    return any(
+        isinstance(block, Block)
+        and block.attn is not None
+        and (block.attn.rope is not None or block.attn.rpe is not None)
+        for block in stage.children()
+    )
+
+
+_RULEBOOK_CONV_ATTRIBUTES = ("subm", "kernel_size", "stride", "padding", "dilation", "algo")
+
+
+def seg3d_rulebook_handoff_stages(
+    encoder: PointTransformerV3Encoder, seg3d_head: nn.Module
+) -> tuple[int, ...]:
+    """Return the decoder stages that can take their rulebook from the encoder.
+
+    A decoder stage whose blocks start with a submanifold convolution builds that convolution's
+    rulebook from the stage's voxels. The encoder stage of the same level holds the same voxels
+    in the same order under the same sparse shape, so an encoder convolution with the same
+    attributes has built the same rulebook already.
+
+    Args:
+        encoder: The model's encoder.
+        seg3d_head: The model's decoder head.
+
+    Returns:
+        Every such stage, in increasing order.
+    """
+    stages = []
+    for stage in _block_stage_indices(seg3d_head.dec_depths):
+        head_conv = stage_submanifold_conv(seg3d_head.dec._modules[f"dec{stage}"])
+        encoder_conv = stage_submanifold_conv(encoder.enc._modules[f"enc{stage}"])
+        if head_conv is None or encoder_conv is None:
+            continue
+        if all(
+            getattr(head_conv, name, None) == getattr(encoder_conv, name, None)
+            for name in _RULEBOOK_CONV_ATTRIBUTES
+        ):
+            stages.append(stage)
+    return tuple(stages)
+
+
+def rulebook_names(stages: Sequence[int]) -> list[str]:
+    """Return the names of the handed-off rulebook tensors, stage by stage."""
+    return [
+        f"rulebook_enc{stage}_{suffix}"
+        for stage in stages
+        for suffix, _, _ in RULEBOOK_HANDOFF_FIELDS
+    ]
+
+
+def build_rulebook_dynamic_axes(stages: Sequence[int]) -> dict[str, dict[int, str]]:
+    """Build dynamic axes for the handed-off rulebook tensors.
+
+    Every axis gets a name of its own: the sizes are the plugin's, not PyTorch's.
+    """
+    return {
+        name: {axis: f"{name}_dim_{axis}" for axis in range(rank)}
+        for name, (_, _, rank) in zip(
+            rulebook_names(stages), RULEBOOK_HANDOFF_FIELDS * len(stages), strict=True
+        )
+    }
+
+
+def attach_submanifold_rulebook(
+    point: Point, conv: nn.Module, rulebook: Sequence[torch.Tensor]
+) -> None:
+    """Hand a rulebook built elsewhere to a stage's submanifold convolutions.
+
+    The rulebook is cached on the stage's sparse tensor under the convolution's indice key,
+    so the convolution reuses it instead of building one from the voxel coordinates.
+
+    Args:
+        point: The stage point, already sparsified.
+        conv: The stage's first submanifold convolution (:func:`stage_submanifold_conv`).
+        rulebook: The tensors of :data:`RULEBOOK_HANDOFF_FIELDS`, in order.
+    """
+    from spconv.pytorch.core import ImplicitGemmIndiceData  # noqa: PLC0415
+
+    sparse = point.sparse_conv_feat
+    if conv.indice_key in sparse.indice_dict:
+        raise ValueError(f"The sparse tensor already holds a rulebook for {conv.indice_key!r}.")
+    fields = {
+        attribute: tensor
+        for (_, attribute, _), tensor in zip(RULEBOOK_HANDOFF_FIELDS, rulebook, strict=True)
+    }
+    sparse.indice_dict[conv.indice_key] = ImplicitGemmIndiceData(
+        out_indices=sparse.indices,
+        indices=sparse.indices,
+        pair_bwd=None,
+        pair_mask_bwd_splits=None,
+        mask_argsort_bwd_splits=None,
+        masks=[None],
+        spatial_shape=sparse.spatial_shape,
+        out_spatial_shape=sparse.spatial_shape,
+        is_subm=True,
+        algo=conv.algo,
+        ksize=conv.kernel_size,
+        stride=conv.stride,
+        dilation=conv.dilation,
+        padding=conv.padding,
+        out_voxel_num=sparse.indices.shape[0],
+        **fields,
+    )
+
+
+def coordinate_free_sparsify(point: Point, sparse_shape: torch.Tensor) -> None:
+    """Give a stage point a sparse tensor without voxel coordinates.
+
+    For a stage whose rulebook is handed in and whose blocks read no coordinates: the
+    convolutions only check the voxel count of the indices, so all-zero indices stand in.
+
+    Args:
+        point: The stage point, holding ``feat``.
+        sparse_shape: The stage's sparse shape.
+    """
+    import spconv.pytorch as spconv  # noqa: PLC0415
+
+    feat = point.feat
+    point["offset"] = shape_as_tensor(feat)[:1].to(feat.device)
+    point["batch"] = torch.zeros_like(feat[:, 0]).long()
+    point["sparse_shape"] = sparse_shape
+    point["sparse_conv_feat"] = spconv.SparseConvTensor(
+        features=feat,
+        indices=torch.zeros((feat.shape[0], 4), dtype=torch.int32, device=feat.device),
+        spatial_shape=sparse_shape.tolist(),
+        batch_size=1,
+    )
+
+
 def make_serialized_pooling_from_flat_inputs(
     serialized_pooling_inputs: Sequence[GraphTensor], field_names: Sequence[str]
 ) -> list[SerializedPoolingMeta]:
@@ -591,6 +776,7 @@ class PTv3EncoderExportModule(nn.Module):
         serialization_orders: Sequence[str],
         sparse_shape: Int64[torch.Tensor, " 3"],
         serialized_depth: Int64[torch.Tensor, ""],
+        rulebook_stages: Sequence[int] = (),
     ) -> None:
         """Initialize the encoder export module.
 
@@ -600,9 +786,15 @@ class PTv3EncoderExportModule(nn.Module):
             serialization_orders: Space-filling curves the export serializes the voxels along.
             sparse_shape: Static sparse shape baked at export time.
             serialized_depth: Serialization depth baked at export time.
+            rulebook_stages: Stages whose submanifold rulebook the graph also returns, for the
+                seg3d head (see :func:`seg3d_rulebook_handoff_stages`).
         """
         super().__init__()
         self.encoder = encoder.prepare_for_export(serialization_orders)
+        self.rulebook_stages = tuple(rulebook_stages)
+        for stage in self.rulebook_stages:
+            if stage_submanifold_conv(self.encoder.enc._modules[f"enc{stage}"]) is None:
+                raise ValueError(f"Encoder stage {stage} has no submanifold convolution.")
         self.voxel_encoder = voxel_encoder
         self.register_buffer("_sparse_shape", sparse_shape.to(dtype=torch.long), persistent=False)
         self.register_buffer("_serialized_depth", serialized_depth, persistent=False)
@@ -615,7 +807,7 @@ class PTv3EncoderExportModule(nn.Module):
         patch_order: Int64[torch.Tensor, "num_orders padded_voxels"],
         serialized_inverse: Int64[torch.Tensor, "num_orders num_voxels"],
         *serialized_pooling_inputs: GraphTensor,
-    ) -> tuple[Float32[torch.Tensor, "stage_voxels stage_channels"], ...]:
+    ) -> tuple[torch.Tensor, ...]:
         """Run the encoder on serialized voxels and return the per-stage features.
 
         Args:
@@ -628,7 +820,8 @@ class PTv3EncoderExportModule(nn.Module):
                 stage by stage.
 
         Returns:
-            The point features of every stage, finest to deepest.
+            The point features of every stage, finest to deepest, then the rulebook of every
+            ``rulebook_stages`` stage (:data:`RULEBOOK_HANDOFF_FIELDS`).
         """
         feat = self.voxel_encoder(voxels, num_points_per_voxel)
         point = self.encoder.export_forward(
@@ -646,30 +839,42 @@ class PTv3EncoderExportModule(nn.Module):
                 "sparse_shape": self._sparse_shape,
             }
         )
-        return tuple(stage.feat for stage in collect_encoder_stage_points(point))
+        stages = collect_encoder_stage_points(point)
+        rulebooks = []
+        for stage in self.rulebook_stages:
+            conv = stage_submanifold_conv(self.encoder.enc._modules[f"enc{stage}"])
+            rulebook = stages[stage].sparse_conv_feat.find_indice_pair(conv.indice_key)
+            rulebooks += [
+                getattr(rulebook, attribute) for _, attribute, _ in RULEBOOK_HANDOFF_FIELDS
+            ]
+        return (*(stage.feat for stage in stages), *rulebooks)
 
     def build_deployment_graph(self) -> DeploymentGraph:
         """Declare this module as the ``ptv3_encoder`` graph.
 
         Returns:
-            The graph from the voxels and their serialization to the per-stage point features.
+            The graph from the voxels and their serialization to the per-stage point features
+            (and the handed-off rulebooks).
         """
         num_pooling_stages = len(self.encoder.stride)
         stage_count = num_pooling_stages + 1
         input_names = encoder_graph_input_names(num_pooling_stages)
+        dynamic_axes = build_ptv3_encoder_dynamic_axes(input_names, stage_count)
+        dynamic_axes.update(build_rulebook_dynamic_axes(self.rulebook_stages))
         return DeploymentGraph(
             ENCODER_GRAPH,
             module=self,
             input_names=input_names,
-            output_names=tuple(stage_feature_names(stage_count)),
-            onnx_dynamic_axes=build_ptv3_encoder_dynamic_axes(input_names, stage_count),
+            output_names=(*stage_feature_names(stage_count), *rulebook_names(self.rulebook_stages)),
+            onnx_dynamic_axes=dynamic_axes,
         )
 
 
 def link_stage_points(
     stage_feats: Sequence[torch.Tensor],
     clusters: Sequence[torch.Tensor],
-    block_stage_metadata: Mapping[int, tuple[torch.Tensor, ...]] | None = None,
+    block_stage_metadata: Mapping[int, tuple[torch.Tensor | None, ...]] | None = None,
+    rulebooks: Mapping[int, tuple[nn.Module, Sequence[torch.Tensor]]] | None = None,
 ) -> Point:
     """Rebuild the encoder pooling chain from per-stage tensors.
 
@@ -681,7 +886,10 @@ def link_stage_points(
             blocks, ``(patch_order, serialized_inverse, grid_coord,
             sparse_shape)`` used to rebuild the serialization and sparse-conv
             views the blocks read. Single-sample export is assumed for the
-            derived batch offsets.
+            derived batch offsets. ``grid_coord`` is ``None`` for a stage whose rulebook is
+            handed in and whose blocks read no coordinates.
+        rulebooks: For every stage whose rulebook is handed in, its first submanifold
+            convolution and the rulebook (see :func:`attach_submanifold_rulebook`).
 
     Returns:
         Deepest point whose ``pooling_parent``/``pooling_inverse`` chain links
@@ -701,11 +909,16 @@ def link_stage_points(
         point = points[stage_index]
         point["patch_order"] = patch_order
         point["serialized_inverse"] = serialized_inverse
-        point["grid_coord"] = grid_coord
-        point["offset"] = shape_as_tensor(grid_coord)[:1].to(grid_coord.device)
-        point["batch"] = torch.zeros_like(grid_coord[:, 0]).long()
-        point["sparse_shape"] = sparse_shape
-        point.sparsify()
+        if grid_coord is None:
+            coordinate_free_sparsify(point, sparse_shape)
+        else:
+            point["grid_coord"] = grid_coord
+            point["offset"] = shape_as_tensor(grid_coord)[:1].to(grid_coord.device)
+            point["batch"] = torch.zeros_like(grid_coord[:, 0]).long()
+            point["sparse_shape"] = sparse_shape
+            point.sparsify()
+    for stage_index, (conv, rulebook) in (rulebooks or {}).items():
+        attach_submanifold_rulebook(points[stage_index], conv, rulebook)
     return points[-1]
 
 
@@ -714,43 +927,70 @@ def _block_stage_indices(dec_depths: Sequence[int]) -> list[int]:
     return [stage for stage, depth in enumerate(dec_depths) if depth > 0]
 
 
-def seg3d_head_export_input_names(stage_count: int, dec_depths: Sequence[int]) -> list[str]:
+def seg3d_head_export_input_names(
+    stage_count: int,
+    dec_depths: Sequence[int],
+    rulebook_stages: Sequence[int] = (),
+    coordinate_free_stages: Collection[int] = (),
+) -> list[str]:
     """Return the split seg-head export input names for a decoder configuration.
 
     The rule is the deployment contract: per-stage features and pooling
     clusters always; for every stage with decoder blocks, that stage's
     serialization metadata (the same tensors, under the same names, that the
-    encoder graph consumes - stage 0 uses the unprefixed base inputs).
+    encoder graph consumes - stage 0 uses the unprefixed base inputs); then the
+    rulebooks the encoder hands over, if any.
 
     Args:
         stage_count: Number of encoder stages.
         dec_depths: Decoder block counts per stage (``stage_count - 1`` entries).
+        rulebook_stages: Stages whose rulebook the head takes from the encoder.
+        coordinate_free_stages: Those of ``rulebook_stages`` that take no ``grid_coord``.
     """
     if len(dec_depths) != stage_count - 1:
         raise ValueError(
             f"dec_depths must have {stage_count - 1} entries for {stage_count} stages, "
             f"got {len(dec_depths)}."
         )
+    if not set(coordinate_free_stages) <= set(rulebook_stages):
+        raise ValueError("Only a stage that takes its rulebook can do without its coordinates.")
     names = [*stage_feature_names(stage_count), *pooling_cluster_names(stage_count)]
     for stage in _block_stage_indices(dec_depths):
         prefix = "" if stage == 0 else f"serialized_pooling_{stage - 1}_"
-        names += [prefix + field for field in _BLOCK_STAGE_META_FIELDS]
-    return names
+        names += [
+            prefix + field for field in _block_stage_meta_fields(stage in coordinate_free_stages)
+        ]
+    return names + rulebook_names(rulebook_stages)
+
+
+def _block_stage_meta_fields(coordinate_free: bool) -> tuple[str, ...]:
+    """Return the serialization metadata a decoder block stage takes."""
+    if coordinate_free:
+        return tuple(field for field in _BLOCK_STAGE_META_FIELDS if field != "grid_coord")
+    return _BLOCK_STAGE_META_FIELDS
 
 
 def build_seg3d_head_input_dynamic_axes(
-    stage_count: int, dec_depths: Sequence[int]
+    stage_count: int,
+    dec_depths: Sequence[int],
+    rulebook_stages: Sequence[int] = (),
+    coordinate_free_stages: Collection[int] = (),
 ) -> dict[str, dict[int, str]]:
-    """Build dynamic axes for the split seg-head export inputs."""
+    """Build dynamic axes for the split seg-head export inputs.
+
+    The arguments are those of :func:`seg3d_head_export_input_names`.
+    """
     dynamic_axes = build_stage_feature_dynamic_axes(stage_count)
     dynamic_axes.update(build_pooling_cluster_dynamic_axes(stage_count))
     for stage in _block_stage_indices(dec_depths):
+        fields = _block_stage_meta_fields(stage in coordinate_free_stages)
         if stage == 0:
-            dynamic_axes.update(build_ptv3_input_dynamic_axes(list(_BLOCK_STAGE_META_FIELDS)))
+            dynamic_axes.update(build_ptv3_input_dynamic_axes(list(fields)))
         else:
             prefix = f"serialized_pooling_{stage - 1}_"
-            for field in _BLOCK_STAGE_META_FIELDS:
+            for field in fields:
                 dynamic_axes[prefix + field] = _serialized_pooling_dynamic_axis(prefix + field)
+    dynamic_axes.update(build_rulebook_dynamic_axes(rulebook_stages))
     return dynamic_axes
 
 
@@ -763,6 +1003,7 @@ class PTv3Seg3DHeadExportModule(nn.Module):
         serialization_orders: Sequence[str],
         sparse_shape: torch.Tensor,
         strides: Sequence[int],
+        rulebook_stages: Sequence[int] = (),
     ) -> None:
         """Initialize the segmentation head export module.
 
@@ -773,11 +1014,27 @@ class PTv3Seg3DHeadExportModule(nn.Module):
                 block stages use it pooled by their cumulative pooling depth
                 (rounded up, see :func:`pooled_sparse_shape`).
             strides: Encoder pooling strides (one per pooling stage).
+            rulebook_stages: Stages whose submanifold rulebook the graph takes from the
+                encoder graph instead of building it (see
+                :func:`seg3d_rulebook_handoff_stages`). Such a stage drops its ``grid_coord``
+                input when its blocks read no coordinates.
         """
         super().__init__()
         self.seg3d_head = seg3d_head.prepare_for_export(serialization_orders)
         self.stage_count = len(strides) + 1
         self.dec_depths = list(self.seg3d_head.dec_depths)
+        self.rulebook_stages = tuple(rulebook_stages)
+        for stage in self.rulebook_stages:
+            if (
+                stage not in _block_stage_indices(self.dec_depths)
+                or self._rulebook_conv(stage) is None
+            ):
+                raise ValueError(f"Decoder stage {stage} has no submanifold convolution.")
+        self.coordinate_free_stages = tuple(
+            stage
+            for stage in self.rulebook_stages
+            if not stage_attention_reads_grid_coord(self.seg3d_head.dec._modules[f"dec{stage}"])
+        )
         cumulative_depth = 0
         stage_depths = [0]
         for stride in strides:
@@ -790,14 +1047,18 @@ class PTv3Seg3DHeadExportModule(nn.Module):
                 persistent=False,
             )
 
+    def _rulebook_conv(self, stage: int) -> nn.Module | None:
+        """Return the submanifold convolution that builds a decoder stage's rulebook."""
+        return stage_submanifold_conv(self.seg3d_head.dec._modules[f"dec{stage}"])
+
     def forward(self, *tensors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Decode per-stage features and return labels and class probabilities.
 
         Args:
             tensors: ``stage_count`` per-stage feature tensors, then
                 ``stage_count - 1`` pooling cluster tensors, then the
-                per-block-stage serialization tensors in the order defined by
-                :func:`seg3d_head_export_input_names`.
+                per-block-stage serialization tensors and the handed-off rulebooks
+                in the order defined by :func:`seg3d_head_export_input_names`.
         """
         stage_feats = tensors[: self.stage_count]
         clusters = tensors[self.stage_count : 2 * self.stage_count - 1]
@@ -808,7 +1069,7 @@ class PTv3Seg3DHeadExportModule(nn.Module):
             # Every stage, including the finest, receives its serialization directly.
             patch_order = extras.pop(0)
             serialized_inverse = extras.pop(0)
-            grid_coord = extras.pop(0)
+            grid_coord = None if stage in self.coordinate_free_stages else extras.pop(0)
             block_stage_metadata[stage] = (
                 patch_order,
                 serialized_inverse,
@@ -816,7 +1077,17 @@ class PTv3Seg3DHeadExportModule(nn.Module):
                 getattr(self, f"_sparse_shape_{stage}"),
             )
 
-        logits = self.seg3d_head(link_stage_points(stage_feats, clusters, block_stage_metadata))
+        rulebook_size = len(RULEBOOK_HANDOFF_FIELDS)
+        rulebooks = {
+            stage: (
+                self._rulebook_conv(stage),
+                extras[index * rulebook_size : (index + 1) * rulebook_size],
+            )
+            for index, stage in enumerate(self.rulebook_stages)
+        }
+        logits = self.seg3d_head(
+            link_stage_points(stage_feats, clusters, block_stage_metadata, rulebooks)
+        )
         probs = torch.softmax(logits, dim=1)
         return probs.argmax(dim=1), probs
 
@@ -826,12 +1097,18 @@ class PTv3Seg3DHeadExportModule(nn.Module):
         Returns:
             The graph from the per-stage features to ``pred_labels`` and ``pred_probs``.
         """
-        dynamic_axes = build_seg3d_head_input_dynamic_axes(self.stage_count, self.dec_depths)
+        interface = (
+            self.stage_count,
+            self.dec_depths,
+            self.rulebook_stages,
+            self.coordinate_free_stages,
+        )
+        dynamic_axes = build_seg3d_head_input_dynamic_axes(*interface)
         dynamic_axes.update(build_point_feature_dynamic_axes(SEG3D_HEAD_OUTPUT_NAMES))
         return DeploymentGraph(
             SEG3D_HEAD_GRAPH,
             module=self,
-            input_names=tuple(seg3d_head_export_input_names(self.stage_count, self.dec_depths)),
+            input_names=tuple(seg3d_head_export_input_names(*interface)),
             output_names=SEG3D_HEAD_OUTPUT_NAMES,
             onnx_dynamic_axes=dynamic_axes,
         )

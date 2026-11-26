@@ -353,9 +353,14 @@ class PTv3Det3DSeg3DModel(PTv3BaseModel):
                 self.EXPORT_ORDER,
                 sparse_shape,
                 serialization_depth,
+                rulebook_stages=self.export_rulebook_stages(),
             ).build_deployment_graph(),
             PTv3Seg3DHeadExportModule(
-                self.seg3d_head, self.EXPORT_ORDER, sparse_shape, self.encoder.stride
+                self.seg3d_head,
+                self.EXPORT_ORDER,
+                sparse_shape,
+                self.encoder.stride,
+                rulebook_stages=self.export_rulebook_stages(),
             ).build_deployment_graph(),
             PTv3Det3DHeadExportModule(
                 self.bev_neck, self.bbox_head, len(self.encoder.stride) + 1

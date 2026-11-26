@@ -95,6 +95,9 @@ model:
   detection3d_loss_weight: 1.0
   grid_size: ${grid_size}
   point_cloud_range: ${point_cloud_range}
+  # the encoder hands its submanifold rulebooks to the exported seg3d head (graph I/O change,
+  # see docs/models/ptv3.md)
+  export_seg3d_rulebook_handoff: false
 
   bbox_head:
     _target_: autoware_ml.models.detection3d.heads.transfusions.transfusion_head.TransFusionHead
