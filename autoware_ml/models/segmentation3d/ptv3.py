@@ -175,6 +175,10 @@ class PTv3Segmentation3DModel(PTv3BaseModel):
                 norm1_row_stats=self.export_norm1_row_stats,
             ).build_deployment_graph(),
             PTv3Seg3DHeadExportModule(
-                self.seg3d_head, self.EXPORT_ORDER, sparse_shape, self.encoder.stride
+                self.seg3d_head,
+                self.EXPORT_ORDER,
+                sparse_shape,
+                self.encoder.stride,
+                norm1_row_stats=self.export_norm1_row_stats,
             ).build_deployment_graph(),
         )

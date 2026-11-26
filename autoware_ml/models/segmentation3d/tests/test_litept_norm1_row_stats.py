@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the LitePT encoder export with norm1 as row statistics."""
+"""Unit tests for the LitePT encoder and seg3d head export with norm1 as row statistics."""
 
 from __future__ import annotations
 
@@ -30,7 +30,6 @@ from torch import nn
 from autoware_ml.models.detection3d.tests.ptv3_detection3d_fixtures import (
     POINT_CLOUD_RANGE,
     build_inputs,
-    build_litept_seg3d_head,
     build_seg3d_model,
 )
 from autoware_ml.models.module_base_model import LogDictConfigs
@@ -43,9 +42,11 @@ from autoware_ml.models.segmentation3d.encoders.ptv3 import (
     fold_norm1_row_statistics,
 )
 from autoware_ml.models.segmentation3d.encoders.voxel import SweepSplitVoxelFeatureEncoder
+from autoware_ml.models.segmentation3d.heads.ptv3 import PTv3Seg3DDecoderHead
 from autoware_ml.models.segmentation3d.ptv3 import PTv3Segmentation3DModel
 from autoware_ml.models.segmentation3d.ptv3_base import (
     ENCODER_GRAPH,
+    SEG3D_HEAD_GRAPH,
     norm1_row_statistic_node_names,
 )
 from autoware_ml.ops.spconv.availability import IS_SPCONV_AVAILABLE
@@ -60,6 +61,8 @@ REQUIRES_SPARSE_CUDA = unittest.skipUnless(
 BASE_ONNX_CONFIG = {"opset_version": 17, "dynamo": False, "do_constant_folding": False}
 #: The operators of one block's row statistics, in graph order.
 ROW_STATISTIC_OPS = ["ReduceMean", "Sub", "Mul", "ReduceMean", "Add", "Sqrt", "Div"]
+#: The graphs with attention blocks, each with two in the test model.
+FOLDED_GRAPHS = (ENCODER_GRAPH, SEG3D_HEAD_GRAPH)
 
 
 def randomize_layer_norms(module: nn.Module, seed: int = 0) -> None:
@@ -112,13 +115,65 @@ def build_attention_block(pre_norm: bool = True) -> Block:
     return block.eval()
 
 
+def build_litept_seg3d_head() -> PTv3Seg3DDecoderHead:
+    """Return a LitePT-style decoder head with one attention block in each of its two stages.
+
+    Returns:
+        The head without convolutional positional encoding, LayerNorm affines randomized.
+    """
+    head = PTv3Seg3DDecoderHead(
+        num_classes=3,
+        ignore_index=-1,
+        order=("z",),
+        enc_channels=(12, 24, 24),
+        dec_depths=(1, 1),
+        dec_channels=(12, 24),
+        dec_num_head=(1, 2),
+        dec_patch_size=(2, 2),
+        mlp_ratio=2.0,
+        qkv_bias=True,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        drop_path=0.0,
+        pre_norm=True,
+        enable_rpe=False,
+        enable_flash=False,
+        upcast_attention=False,
+        upcast_softmax=False,
+        mixed_voxel_weight=0.0,
+        dec_conv=False,
+        dec_rope_base=100.0,
+    )
+    randomize_layer_norms(head)
+    return head
+
+
+def attention_norm1_types(module: nn.Module) -> list[type]:
+    """Return the type of every attention block's norm1 in a module.
+
+    Args:
+        module: Module whose attention blocks are listed.
+
+    Returns:
+        The norm1 module types in module order.
+    """
+    return [
+        type(block.norm1._modules["0"])
+        for block in module.modules()
+        if isinstance(block, Block) and block.attn is not None
+    ]
+
+
 def build_litept_model(
     export_norm1_row_stats: bool = False, patch_sizes: Sequence[int] = (2, 2, 2)
 ) -> PTv3Segmentation3DModel:
-    """Return a small LitePT segmentation model with two attention blocks in its last stage.
+    """Return a small LitePT segmentation model with attention blocks in its encoder and head.
+
+    The encoder has two attention blocks in its last stage, the head one in each decoder stage.
 
     Args:
-        export_norm1_row_stats: Whether the exported encoder folds norm1 into qkv.
+        export_norm1_row_stats: Whether the exported encoder and head fold norm1 into qkv.
         patch_sizes: Attention window of every level, the input level first.
 
     Returns:
@@ -213,34 +268,42 @@ class TestNorm1Fold(unittest.TestCase):
             block.fold_norm1_into_qkv()
 
     def test_fold_reaches_every_attention_block_and_no_other(self) -> None:
-        """Test that the encoder fold changes the attention blocks only.
+        """Test that the fold changes the attention blocks only, in the encoder and the head.
 
         Input: the export copy of a LitePT encoder with one convolution-only block in each of
-            two stages and two attention blocks in the last.
-        Expected: two blocks folded; their norm1 is the row statistics, the other blocks
-            keep theirs.
-        Check: the returned count and the norm1 module types.
+            two stages and two attention blocks in the last; the export copy of a decoder
+            head with one attention block in each of its two stages.
+        Expected: two blocks folded in each; their norm1 is the row statistics, the other
+            blocks keep theirs.
+        Check: the returned counts and the norm1 module types.
         """
-        encoder = build_litept_model().encoder.prepare_for_export(("z",))
+        model = build_litept_model()
+        encoder = model.encoder.prepare_for_export(("z",))
         self.assertEqual(fold_norm1_row_statistics(encoder), 2)
         for block in (child for child in encoder.modules() if isinstance(child, Block)):
             if block.attn is None:
                 self.assertIsNone(block.norm1)
             else:
                 self.assertIsInstance(block.norm1._modules["0"], Norm1RowStatistics)
+        head = model.seg3d_head.prepare_for_export(("z",))
+        self.assertEqual(fold_norm1_row_statistics(head), 2)
+        self.assertEqual(attention_norm1_types(head), [Norm1RowStatistics] * 2)
 
 
 class TestOption(unittest.TestCase):
     """``export_norm1_row_stats`` on the task model."""
 
-    def test_option_is_off_by_default_litept_only_and_reaches_the_encoder_graph(self) -> None:
+    def test_option_is_off_by_default_litept_only_and_reaches_the_encoder_and_head(
+        self,
+    ) -> None:
         """Test that only a LitePT model folds, only on request, and only in the export copy.
 
         Input: the LitePT model with the default settings and with the option; the PTv3 test
             model with the option.
-        Expected: off by default; with the option the encoder graph's module has row
-            statistics in its attention blocks while the model's own encoder keeps its
-            LayerNorms; the graphs keep their names, inputs and outputs; PTv3 refuses it.
+        Expected: off by default; with the option the encoder and seg3d head graphs' modules
+            have row statistics in their attention blocks while the model's own encoder and
+            head keep their LayerNorms; the graphs keep their names, inputs and outputs;
+            PTv3 refuses it.
         Check: the attribute, the norm1 modules and the graphs' names and I/O.
         """
         default = build_litept_model()
@@ -249,17 +312,15 @@ class TestOption(unittest.TestCase):
         self.assertTrue(folded.export_norm1_row_stats)
         default_graphs = {graph.name: graph for graph in default.deployment_graphs()}
         folded_graphs = {graph.name: graph for graph in folded.deployment_graphs()}
-
-        def norm1_types(module: nn.Module) -> list[type]:
-            return [
-                type(block.norm1._modules["0"])
-                for block in module.modules()
-                if isinstance(block, Block) and block.attn is not None
-            ]
-
-        self.assertEqual(norm1_types(default_graphs[ENCODER_GRAPH].module), [nn.LayerNorm] * 2)
-        self.assertEqual(norm1_types(folded_graphs[ENCODER_GRAPH].module), [Norm1RowStatistics] * 2)
-        self.assertEqual(norm1_types(folded.encoder), [nn.LayerNorm] * 2)
+        for name in FOLDED_GRAPHS:
+            self.assertEqual(
+                attention_norm1_types(default_graphs[name].module), [nn.LayerNorm] * 2, name
+            )
+            self.assertEqual(
+                attention_norm1_types(folded_graphs[name].module), [Norm1RowStatistics] * 2, name
+            )
+        self.assertEqual(attention_norm1_types(folded.encoder), [nn.LayerNorm] * 2)
+        self.assertEqual(attention_norm1_types(folded.seg3d_head), [nn.LayerNorm] * 2)
         self.assertEqual(set(default_graphs), set(folded_graphs))
         for name, graph in default_graphs.items():
             self.assertEqual(graph.input_names, folded_graphs[name].input_names, name)
@@ -279,8 +340,8 @@ class TestOption(unittest.TestCase):
 
 
 @REQUIRES_SPARSE_CUDA
-class TestEncoderExport(unittest.TestCase):
-    """The exported LitePT encoder with norm1 as row statistics."""
+class TestExport(unittest.TestCase):
+    """The exported LitePT encoder and seg3d head with norm1 as row statistics."""
 
     def setUp(self) -> None:
         """Build one batch, and the LitePT model without and with the option on CUDA."""
@@ -290,28 +351,31 @@ class TestEncoderExport(unittest.TestCase):
             folded: build_litept_model(folded).to(self.device).eval() for folded in (False, True)
         }
 
-    def test_encoder_graph_outputs_match_the_unfolded_export(self) -> None:
-        """Test that the folded encoder graph returns the unfolded graph's stage features.
+    def test_graph_outputs_match_the_unfolded_export(self) -> None:
+        """Test that the folded graphs return the unfolded graphs' outputs.
 
-        Input: the encoder graph modules without and with the option, on the same traced
-            inputs.
-        Expected: every stage feature agrees to fp32 rounding.
+        Input: the encoder and seg3d head graph modules without and with the option, on the
+            same traced inputs.
+        Expected: every encoder stage feature and the head's class probabilities agree to
+            fp32 rounding (the head's labels are their argmax).
         Check: assert_close with 1e-5 tolerances.
         """
-        outputs = {}
-        for folded, model in self.models.items():
-            spec = model.build_export_specs(self.batch)[ENCODER_GRAPH]
-            with torch.no_grad():
-                outputs[folded] = spec.module(*spec.args)
-        self.assertEqual(len(outputs[True]), len(outputs[False]))
-        for unfolded_feat, folded_feat in zip(outputs[False], outputs[True], strict=True):
-            torch.testing.assert_close(folded_feat, unfolded_feat, rtol=1e-5, atol=1e-5)
+        for name in FOLDED_GRAPHS:
+            outputs = {}
+            for folded, model in self.models.items():
+                spec = model.build_export_specs(self.batch)[name]
+                with torch.no_grad():
+                    outputs[folded] = spec.module(*spec.args)
+            self.assertEqual(len(outputs[True]), len(outputs[False]), name)
+            for unfolded, folded in zip(outputs[False], outputs[True], strict=True):
+                if unfolded.is_floating_point():
+                    torch.testing.assert_close(folded, unfolded, rtol=1e-5, atol=1e-5, msg=name)
 
     def test_export_replaces_norm1_by_named_row_statistics(self) -> None:
         """Test the exported operators and the names of the statistic nodes.
 
-        Input: the encoder graph without and with the option, exported with the base configs'
-            ONNX settings.
+        Input: the encoder and seg3d head graphs without and with the option, exported with
+            the base configs' ONNX settings.
         Expected: per attention block, the folded graph has one LayerNormalization fewer and
             the seven statistic nodes, a second Gather and a Mul more; the statistic nodes are
             exactly the nodes under ``/stats_fp32/``, seven per block in operator order, their
@@ -319,14 +383,24 @@ class TestEncoderExport(unittest.TestCase):
             outputs are unchanged.
         Check: operator counts, node names and the serialized graph inputs and outputs.
         """
+        for graph_name in FOLDED_GRAPHS:
+            with self.subTest(graph=graph_name):
+                self._check_export(graph_name, blocks=2)
+
+    def _check_export(self, graph_name: str, blocks: int) -> None:
+        """Export one graph without and with the option and check the folded one.
+
+        Args:
+            graph_name: The deployment graph to export.
+            blocks: Its number of attention blocks.
+        """
         graphs = {}
         with tempfile.TemporaryDirectory() as directory:
             for folded, model in self.models.items():
                 path = Path(directory) / f"{folded}.onnx"
-                spec = model.build_export_specs(self.batch)[ENCODER_GRAPH]
+                spec = model.build_export_specs(self.batch)[graph_name]
                 export_to_onnx(spec, OmegaConf.create(BASE_ONNX_CONFIG), path)
                 graphs[folded] = onnx.load(path)
-        blocks = 2
         ops = {
             folded: Counter(node.op_type for node in m.graph.node) for folded, m in graphs.items()
         }

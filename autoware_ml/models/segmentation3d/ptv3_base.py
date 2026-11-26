@@ -157,9 +157,10 @@ class PTv3BaseModel(ModuleBaseModel):
             log_dict_configs: Logging configuration for training and validation.
             freeze_encoder: When ``True``, the encoder is permanently kept
                 in eval mode with its parameters frozen.
-            export_norm1_row_stats: When ``True``, the exported encoder computes each
-                attention block's norm1 as row statistics with the centring and the affine
-                folded into ``qkv`` (see :meth:`Block.fold_norm1_into_qkv`). LitePT only.
+            export_norm1_row_stats: When ``True``, the exported encoder and segmentation
+                head compute each attention block's norm1 as row statistics with the
+                centring and the affine folded into ``qkv`` (see
+                :meth:`Block.fold_norm1_into_qkv`). LitePT only.
             **kwargs: Keyword arguments forwarded to :class:`ModuleBaseModel` (and
                 further up the MRO chain).
 
@@ -691,7 +692,7 @@ class PTv3EncoderExportModule(nn.Module):
 
 
 def norm1_row_statistic_node_names(onnx_model: Any) -> list[str]:
-    """Return the row-statistic nodes of an encoder exported with ``norm1_row_stats``.
+    """Return the row-statistic nodes of a graph exported with ``norm1_row_stats``.
 
     They are the nodes in the ``stats_fp32`` scope of each folded norm1, seven per attention
     block (``.../norm1/norm1.0/stats_fp32/ReduceMean`` and so on). The TensorRT parser names
@@ -700,7 +701,7 @@ def norm1_row_statistic_node_names(onnx_model: Any) -> list[str]:
     ``--layerOutputTypes`` set to ``fp32`` for each of them.
 
     Args:
-        onnx_model: The loaded ``ptv3_encoder`` ONNX model.
+        onnx_model: The loaded ``ptv3_encoder`` or ``ptv3_seg3d_head`` ONNX model.
 
     Returns:
         The statistic node names in graph order; empty for an export without the option.
@@ -806,6 +807,7 @@ class PTv3Seg3DHeadExportModule(nn.Module):
         serialization_orders: Sequence[str],
         sparse_shape: torch.Tensor,
         strides: Sequence[int],
+        norm1_row_stats: bool = False,
     ) -> None:
         """Initialize the segmentation head export module.
 
@@ -816,9 +818,15 @@ class PTv3Seg3DHeadExportModule(nn.Module):
                 block stages use it pooled by their cumulative pooling depth
                 (rounded up, see :func:`pooled_sparse_shape`).
             strides: Encoder pooling strides (one per pooling stage).
+            norm1_row_stats: When ``True``, every attention block's norm1 in the decoder is
+                folded into its ``qkv`` and exported as row statistics
+                (:func:`fold_norm1_row_statistics`);
+                :func:`norm1_row_statistic_node_names` lists the statistic nodes.
         """
         super().__init__()
         self.seg3d_head = seg3d_head.prepare_for_export(serialization_orders)
+        if norm1_row_stats:
+            fold_norm1_row_statistics(self.seg3d_head)
         self.stage_count = len(strides) + 1
         self.dec_depths = list(self.seg3d_head.dec_depths)
         cumulative_depth = 0

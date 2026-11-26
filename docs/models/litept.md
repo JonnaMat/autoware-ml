@@ -93,21 +93,25 @@ is future work.
 ### norm1 as row statistics
 
 With `model.export_norm1_row_stats: true` (default `false`, LitePT encoders only)
-the exported encoder computes the `norm1` LayerNorm of every attention block
-(the four blocks of the last two stages) without a `LayerNormalization` node.
+the exported encoder and segmentation head compute the `norm1` LayerNorm of every
+attention block (the four encoder blocks of the last two stages and the two
+decoder blocks of `dec3` and `dec2`) without a `LayerNormalization` node.
 Each block's attention gathers the `norm1` output into windows before `qkv`;
 with the option it gathers the block input instead and scales the gathered
 rows by their reciprocal standard deviation, and the LayerNorm's centring and
 affine are folded into the `qkv` weights:
 `W' = W diag(gamma) (I - 11^T / C)`, `b' = b + W beta`
 (`Block.fold_norm1_into_qkv` in `encoders/ptv3.py`). The result is the same in
-real arithmetic; the graph inputs and outputs do not change.
+real arithmetic; the graph inputs and outputs do not change, and the detection
+head is not affected.
 
 The reciprocal standard deviation is computed by seven nodes per block
 (`ReduceMean`, `Sub`, `Mul`, `ReduceMean`, `Add`, `Sqrt`, `Div`), all in the
-scope `.../norm1/norm1.0/stats_fp32/`, 28 for the LitePT encoder.
-**These layers must be built in fp32**, the rest of the engine can be fp16:
-in fp16 the statistics lose accuracy. With `trtexec`, for example:
+scope `.../norm1/norm1.0/stats_fp32/`: 28 in `ptv3_encoder` and 14 in
+`ptv3_seg3d_head` for LitePT.
+**These layers must be built in fp32**, the rest of the engines can be fp16:
+in fp16 the statistics lose accuracy. With `trtexec`, for example, for each of
+the two engines:
 
 ```bash
 trtexec --onnx=ptv3_encoder.onnx --fp16 --precisionConstraints=obey \

@@ -80,9 +80,9 @@ model:
     sync_dist: true
   grid_size: ${grid_size}
   point_cloud_range: ${point_cloud_range}
-  # LitePT encoders only: the exported encoder computes each attention block's norm1 as row
-  # statistics with the centring and the affine folded into qkv; the 7 statistic nodes per
-  # block must be built in fp32 (see docs/models/litept.md)
+  # LitePT encoders only: the exported encoder and seg3d head compute each attention block's
+  # norm1 as row statistics with the centring and the affine folded into qkv; the 7 statistic
+  # nodes per block must be built in fp32 (see docs/models/litept.md)
   export_norm1_row_stats: false
   optimizer: ${optimizer}
   optimizer_group_overrides:
