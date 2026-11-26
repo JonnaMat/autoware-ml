@@ -353,6 +353,7 @@ class PTv3Det3DSeg3DModel(PTv3BaseModel):
                 self.EXPORT_ORDER,
                 sparse_shape,
                 serialization_depth,
+                norm1_row_stats=self.export_norm1_row_stats,
             ).build_deployment_graph(),
             PTv3Seg3DHeadExportModule(
                 self.seg3d_head, self.EXPORT_ORDER, sparse_shape, self.encoder.stride

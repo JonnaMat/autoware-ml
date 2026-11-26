@@ -668,7 +668,13 @@ class SerializedAttention(PointModule):
             pad, unpad, cu_seqlens = self._get_padding_and_inverse(point)
             order = point.serialized_order[self.order_index][pad]
             inverse = unpad[point.serialized_inverse[self.order_index]]
-        qkv = self.qkv(point.feat[order])
+        rows = point.feat[order]
+        # Set by `Norm1RowStatistics` when the block's norm1 is folded into `qkv` for export: the
+        # rows are scaled by their reciprocal standard deviation after the gather.
+        row_scale = point.pop(QKV_ROW_SCALE_KEY, None)
+        if row_scale is not None:
+            rows = rows * row_scale[order]
+        qkv = self.qkv(rows)
         head_dim = channel_count // head_count
 
         # With RoPE the projection has to be split before attention so queries
@@ -804,6 +810,83 @@ class Cpe(PointSequential):
         conv.weight.copy_(folded_conv_weight.to(conv.weight.dtype))
         conv.bias.copy_(folded_conv_bias.to(conv.bias.dtype))
         self.add_module("1", nn.Identity())
+
+
+#: Point key under which :class:`Norm1RowStatistics` hands the row scale to the attention.
+QKV_ROW_SCALE_KEY = "qkv_row_scale"
+#: Module name, and so ONNX scope, of the row statistics of a folded norm1. The exported nodes
+#: under ``.../norm1/norm1.0/stats_fp32/`` are exactly the statistic nodes.
+ROW_STATISTICS_SCOPE = "stats_fp32"
+
+
+class LayerNormRowStatistics(nn.Module):
+    """Compute the reciprocal standard deviation of each row as ``nn.LayerNorm`` does.
+
+    Export-only. It exports as exactly seven nodes, ``ReduceMean``, ``Sub``, ``Mul``,
+    ``ReduceMean``, ``Add``, ``Sqrt`` and ``Div``, whose constants are initializers, so that a
+    TensorRT build can pin these layers to fp32 by name while the rest of the graph runs in fp16.
+    The ONNX exporter replaces repeated initializers of equal value by ``Identity`` nodes, so
+    the modules of one graph should share their ``eps`` and ``one`` tensors (see
+    :func:`fold_norm1_row_statistics`).
+    """
+
+    def __init__(self, eps: torch.Tensor, one: torch.Tensor) -> None:
+        """Initialize the row statistics.
+
+        Args:
+            eps: The LayerNorm's epsilon as a 0-d tensor, added to the variance.
+            one: A 0-d tensor holding 1, the numerator of the reciprocal.
+        """
+        super().__init__()
+        self.register_buffer("eps", eps)
+        self.register_buffer("one", one)
+
+    def forward(
+        self, x: Float[torch.Tensor, "num_points channels"]
+    ) -> Float[torch.Tensor, "num_points 1"]:
+        """Return ``1 / sqrt(var(x) + eps)`` per row, with the biased variance.
+
+        Args:
+            x: Rows to normalise.
+
+        Returns:
+            The reciprocal standard deviation of each row.
+        """
+        mean = x.mean(dim=-1, keepdim=True)
+        centred = x - mean
+        variance = (centred * centred).mean(dim=-1, keepdim=True)
+        return self.one / torch.sqrt(variance + self.eps)
+
+
+class Norm1RowStatistics(PointModule):
+    """Stand in for a pre-norm block's ``norm1`` whose centring and affine sit in ``qkv``.
+
+    Export-only, see :meth:`Block.fold_norm1_into_qkv`. It leaves the features as they are and
+    passes their reciprocal row standard deviation to the attention, which scales the gathered
+    rows with it before ``qkv``.
+    """
+
+    def __init__(self, eps: torch.Tensor, one: torch.Tensor) -> None:
+        """Initialize the stand-in.
+
+        Args:
+            eps: The replaced LayerNorm's epsilon as a 0-d tensor.
+            one: A 0-d tensor holding 1.
+        """
+        super().__init__()
+        self.add_module(ROW_STATISTICS_SCOPE, LayerNormRowStatistics(eps, one))
+
+    def forward(self, point: Point) -> Point:
+        """Attach the row scale of the block input for the attention.
+
+        Args:
+            point: Point container entering the attention.
+
+        Returns:
+            The same container with unchanged features and the row scale attached.
+        """
+        point[QKV_ROW_SCALE_KEY] = getattr(self, ROW_STATISTICS_SCOPE)(point.feat)
+        return point
 
 
 class Block(PointModule):
@@ -943,6 +1026,69 @@ class Block(PointModule):
                 point = self.norm2(point)
         point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
         return point
+
+    @torch.no_grad()
+    def fold_norm1_into_qkv(
+        self, constants: dict[float, tuple[torch.Tensor, torch.Tensor]] | None = None
+    ) -> None:
+        """Fold norm1's centring and affine into ``qkv``, leaving only the row statistics.
+
+        ``qkv(LN(x))`` equals ``qkv'(x * rstd(x))`` with ``W' = W diag(gamma) (I - 11^T / C)``
+        and ``b' = b + W beta``, where ``rstd`` is the reciprocal standard deviation of each row
+        of ``x``: the centring projection subtracts the row mean, and the attention gathers the
+        rows before it scales them, as the row statistics commute with the gather. ``norm1``
+        becomes :class:`Norm1RowStatistics`, which computes ``rstd`` in seven nodes under the
+        ``stats_fp32`` scope. Exact in real arithmetic. In fp16, ``W'`` cancels the row mean
+        inside the ``qkv`` GEMM, so its accuracy depends on the rows' mean being small against
+        their spread; the statistics themselves have to be built in fp32. Meant for an export
+        copy, the parameters change in place.
+
+        Args:
+            constants: The ``(eps, one)`` tensors of the row statistics by epsilon, shared
+                between the blocks of one graph; missing entries are added.
+
+        Raises:
+            ValueError: If the block has no attention or does not normalise before it.
+        """
+        if self.attn is None or self.norm1 is None or not self.pre_norm:
+            raise ValueError("Only a pre-norm block with attention has a norm1 to fold into qkv.")
+        layer_norm = self.norm1._modules["0"]
+        if not isinstance(layer_norm, nn.LayerNorm) or len(self.norm1._modules) != 1:
+            raise ValueError("norm1 is not a single LayerNorm.")
+        qkv = self.attn.qkv
+        channels = qkv.in_features
+        weight = qkv.weight.double()
+        bias = (
+            qkv.bias.double()
+            if qkv.bias is not None
+            else weight.new_zeros(qkv.out_features, dtype=torch.float64)
+        )
+        gamma = (
+            layer_norm.weight.double()
+            if layer_norm.weight is not None
+            else weight.new_ones(channels, dtype=torch.float64)
+        )
+        beta = (
+            layer_norm.bias.double()
+            if layer_norm.bias is not None
+            else weight.new_zeros(channels, dtype=torch.float64)
+        )
+        centring = torch.eye(channels, dtype=torch.float64, device=weight.device) - 1.0 / channels
+        folded_bias = (bias + weight @ beta).to(qkv.weight.dtype)
+        qkv.weight.copy_(((weight * gamma[None, :]) @ centring).to(qkv.weight.dtype))
+        if qkv.bias is None:
+            qkv.bias = nn.Parameter(folded_bias)
+        else:
+            qkv.bias.copy_(folded_bias)
+        if constants is None:
+            constants = {}
+        eps = float(layer_norm.eps)
+        if eps not in constants:
+            constants[eps] = (
+                torch.tensor(eps, dtype=torch.float32, device=weight.device),
+                torch.tensor(1.0, dtype=torch.float32, device=weight.device),
+            )
+        self.norm1 = PointSequential(Norm1RowStatistics(*constants[eps]))
 
 
 class FullPrecisionLinear(nn.Linear):
@@ -1237,6 +1383,27 @@ def prepare_point_module_for_export(module: nn.Module) -> None:
             child.shuffle_orders = False
         if isinstance(child, Cpe):
             child.fold_linear()
+
+
+def fold_norm1_row_statistics(module: nn.Module) -> int:
+    """Fold every attention block's norm1 into its ``qkv`` (see :meth:`Block.fold_norm1_into_qkv`).
+
+    Export-only, for an export copy prepared by :func:`prepare_point_module_for_export`. The
+    blocks share the constants of their row statistics, so that each is one initializer.
+
+    Args:
+        module: Module hierarchy whose attention blocks are changed in place.
+
+    Returns:
+        The number of folded blocks.
+    """
+    blocks = [
+        child for child in module.modules() if isinstance(child, Block) and child.attn is not None
+    ]
+    constants: dict[float, tuple[torch.Tensor, torch.Tensor]] = {}
+    for block in blocks:
+        block.fold_norm1_into_qkv(constants)
+    return len(blocks)
 
 
 def deepcopy_without_flash(module: nn.Module) -> nn.Module:

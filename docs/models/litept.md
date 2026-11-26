@@ -90,6 +90,38 @@ The deployed node binds the inputs the artifact declares rather than the full
 PTv3 list, so a subset is a drop-in engine. Narrowing the declaration to match
 is future work.
 
+### norm1 as row statistics
+
+With `model.export_norm1_row_stats: true` (default `false`, LitePT encoders only)
+the exported encoder computes the `norm1` LayerNorm of every attention block
+(the four blocks of the last two stages) without a `LayerNormalization` node.
+Each block's attention gathers the `norm1` output into windows before `qkv`;
+with the option it gathers the block input instead and scales the gathered
+rows by their reciprocal standard deviation, and the LayerNorm's centring and
+affine are folded into the `qkv` weights:
+`W' = W diag(gamma) (I - 11^T / C)`, `b' = b + W beta`
+(`Block.fold_norm1_into_qkv` in `encoders/ptv3.py`). The result is the same in
+real arithmetic; the graph inputs and outputs do not change.
+
+The reciprocal standard deviation is computed by seven nodes per block
+(`ReduceMean`, `Sub`, `Mul`, `ReduceMean`, `Add`, `Sqrt`, `Div`), all in the
+scope `.../norm1/norm1.0/stats_fp32/`, 28 for the LitePT encoder.
+**These layers must be built in fp32**, the rest of the engine can be fp16:
+in fp16 the statistics lose accuracy. With `trtexec`, for example:
+
+```bash
+trtexec --onnx=ptv3_encoder.onnx --fp16 --precisionConstraints=obey \
+  --layerPrecisions=<name>:fp32,... --layerOutputTypes=<name>:fp32,...
+```
+
+`norm1_row_statistic_node_names` in `ptv3_base.py` returns the node names
+(the nodes whose name contains `/stats_fp32/`); TensorRT's ONNX parser names
+each layer after its node.
+
+Not for PTv3: its `norm1` rows have a large mean relative to their spread,
+which the fp16 `qkv` GEMM with the folded centring does not cancel accurately
+enough, so the option is refused for any encoder other than `LitePTEncoder`.
+
 ## Implementation
 
 | Path                                                  | Description                                   |

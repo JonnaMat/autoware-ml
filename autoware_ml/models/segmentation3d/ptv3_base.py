@@ -30,7 +30,9 @@ from autoware_ml.dataclasses.models.model_batch_inputs import ModelBatchInputs
 from autoware_ml.deployment.graphs import DeploymentGraph, GraphExecutor, GraphTensor
 from autoware_ml.models.module_base_model import LogDictConfigs, ModuleBaseModel
 from autoware_ml.models.segmentation3d.encoders.ptv3 import (
+    ROW_STATISTICS_SCOPE,
     Block,
+    LitePTEncoder,
     PointTransformerV3Encoder,
     SerializedPooling,
     SerializedPoolingMeta,
@@ -38,6 +40,7 @@ from autoware_ml.models.segmentation3d.encoders.ptv3 import (
     build_patch_order,
     build_serialized_pooling_meta,
     collect_encoder_stage_points,
+    fold_norm1_row_statistics,
 )
 from autoware_ml.models.segmentation3d.encoders.voxel import VoxelFeatureEncoder
 from autoware_ml.utils.point_cloud.batching import batch_to_offset
@@ -139,6 +142,7 @@ class PTv3BaseModel(ModuleBaseModel):
         point_cloud_range: Sequence[float] | None,
         log_dict_configs: LogDictConfigs,
         freeze_encoder: bool = False,
+        export_norm1_row_stats: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the PTv3 base model.
@@ -153,8 +157,15 @@ class PTv3BaseModel(ModuleBaseModel):
             log_dict_configs: Logging configuration for training and validation.
             freeze_encoder: When ``True``, the encoder is permanently kept
                 in eval mode with its parameters frozen.
+            export_norm1_row_stats: When ``True``, the exported encoder computes each
+                attention block's norm1 as row statistics with the centring and the affine
+                folded into ``qkv`` (see :meth:`Block.fold_norm1_into_qkv`). LitePT only.
             **kwargs: Keyword arguments forwarded to :class:`ModuleBaseModel` (and
                 further up the MRO chain).
+
+        Raises:
+            ValueError: If the encoder reads other point features than the voxel encoder
+                writes, or ``export_norm1_row_stats`` is set for an encoder that is not LitePT.
         """
         super().__init__(log_dict_configs=log_dict_configs, **kwargs)
         if encoder.in_channels != voxel_encoder.out_channels:
@@ -171,6 +182,13 @@ class PTv3BaseModel(ModuleBaseModel):
         if self.grid_size is not None and self.point_cloud_range is not None:
             validate_serialization_geometry(encoder, self.grid_size, self.point_cloud_range)
         self.freeze_encoder = bool(freeze_encoder)
+        # Measured for LitePT only: with PTv3's encoder the fp16 fold loses accuracy.
+        if export_norm1_row_stats and not isinstance(encoder, LitePTEncoder):
+            raise ValueError(
+                "export_norm1_row_stats is supported for the LitePT encoder only, got "
+                f"{type(encoder).__name__}."
+            )
+        self.export_norm1_row_stats = bool(export_norm1_row_stats)
         if self.freeze_encoder:
             self.encoder.requires_grad_(False)
             self.encoder.eval()
@@ -591,6 +609,7 @@ class PTv3EncoderExportModule(nn.Module):
         serialization_orders: Sequence[str],
         sparse_shape: Int64[torch.Tensor, " 3"],
         serialized_depth: Int64[torch.Tensor, ""],
+        norm1_row_stats: bool = False,
     ) -> None:
         """Initialize the encoder export module.
 
@@ -600,9 +619,14 @@ class PTv3EncoderExportModule(nn.Module):
             serialization_orders: Space-filling curves the export serializes the voxels along.
             sparse_shape: Static sparse shape baked at export time.
             serialized_depth: Serialization depth baked at export time.
+            norm1_row_stats: When ``True``, every attention block's norm1 is folded into its
+                ``qkv`` and exported as row statistics (:func:`fold_norm1_row_statistics`);
+                :func:`norm1_row_statistic_node_names` lists the statistic nodes.
         """
         super().__init__()
         self.encoder = encoder.prepare_for_export(serialization_orders)
+        if norm1_row_stats:
+            fold_norm1_row_statistics(self.encoder)
         self.voxel_encoder = voxel_encoder
         self.register_buffer("_sparse_shape", sparse_shape.to(dtype=torch.long), persistent=False)
         self.register_buffer("_serialized_depth", serialized_depth, persistent=False)
@@ -664,6 +688,25 @@ class PTv3EncoderExportModule(nn.Module):
             output_names=tuple(stage_feature_names(stage_count)),
             onnx_dynamic_axes=build_ptv3_encoder_dynamic_axes(input_names, stage_count),
         )
+
+
+def norm1_row_statistic_node_names(onnx_model: Any) -> list[str]:
+    """Return the row-statistic nodes of an encoder exported with ``norm1_row_stats``.
+
+    They are the nodes in the ``stats_fp32`` scope of each folded norm1, seven per attention
+    block (``.../norm1/norm1.0/stats_fp32/ReduceMean`` and so on). The TensorRT parser names
+    each layer after its node, so this is the list of layers to build in fp32, for example
+    ``trtexec --fp16 --precisionConstraints=obey`` with ``--layerPrecisions`` and
+    ``--layerOutputTypes`` set to ``fp32`` for each of them.
+
+    Args:
+        onnx_model: The loaded ``ptv3_encoder`` ONNX model.
+
+    Returns:
+        The statistic node names in graph order; empty for an export without the option.
+    """
+    scope = f"/{ROW_STATISTICS_SCOPE}/"
+    return [node.name for node in onnx_model.graph.node if scope in node.name]
 
 
 def link_stage_points(
