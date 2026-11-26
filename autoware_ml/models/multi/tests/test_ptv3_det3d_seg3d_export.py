@@ -269,11 +269,14 @@ def _save_detection3d_checkpoint(
     return checkpoint_path
 
 
-def _build_det3d_seg3d_model(patch_sizes: Sequence[int] = (4, 4)) -> PTv3Det3DSeg3DModel:
+def _build_det3d_seg3d_model(
+    patch_sizes: Sequence[int] = (4, 4), export_seg3d_label_fold: bool = False
+) -> PTv3Det3DSeg3DModel:
     """Return a small joint PTv3 model over the test encoder.
 
     Args:
         patch_sizes: Attention window of every level, the input level first.
+        export_seg3d_label_fold: Whether the exported seg3d head computes its labels as a fold.
 
     Returns:
         The joint model on the CPU.
@@ -288,6 +291,7 @@ def _build_det3d_seg3d_model(patch_sizes: Sequence[int] = (4, 4)) -> PTv3Det3DSe
         bbox_head=build_transfusion_head(),
         grid_size=1.0,
         point_cloud_range=[0.0, 0.0, -2.0, 8.0, 8.0, 2.0],
+        export_seg3d_label_fold=export_seg3d_label_fold,
     )
 
 
@@ -381,6 +385,42 @@ def test_ptv3_det3d_seg3d_deployment_reproduces_forward() -> None:
     cuda = torch.device("cuda")
     batch = build_inputs(device=cuda)
     model = _build_det3d_seg3d_model(whole_level_patch_sizes(batch)).cuda().eval()
+    assert_deployment_reproduces_forward(model, batch, cuda, _joint_tensors, rtol=1e-5, atol=1e-5)
+
+
+def test_ptv3_det3d_seg3d_label_fold_is_off_by_default_and_reaches_the_seg3d_head() -> None:
+    """Test that the joint model's seg3d head graph computes its labels as a fold only on request.
+
+    Input: the joint model with the default settings and with ``export_seg3d_label_fold``.
+    Expected: off by default; once set, the seg3d head graph's module folds and the other
+        graphs keep their names.
+    Check: the ``label_fold`` of the seg3d head graph's module and the graph names.
+    """
+    for label_fold in (False, True):
+        kwargs = {"export_seg3d_label_fold": True} if label_fold else {}
+        model = _build_det3d_seg3d_model(**kwargs)
+        graphs = {graph.name: graph for graph in model.deployment_graphs()}
+        assert set(graphs) == {ENCODER_GRAPH, SEG3D_HEAD_GRAPH, DET3D_HEAD_GRAPH}
+        assert model.export_seg3d_label_fold is label_fold
+        assert graphs[SEG3D_HEAD_GRAPH].module.label_fold is label_fold
+
+
+@pytest.mark.skipif(
+    not IS_SPCONV_AVAILABLE or not torch.cuda.is_available(),
+    reason="PTv3 sparse-convolution export tests require CUDA spconv",
+)
+def test_ptv3_det3d_seg3d_deployment_with_label_fold_reproduces_forward() -> None:
+    """Test that the joint deployment with the seg3d label fold reproduces forward().
+
+    Input: a joint model with ``export_seg3d_label_fold`` whose window at every level is that
+        level's voxel count, and one batch.
+    Expected: the labels equal forward()'s argmax and every other output matches to 1e-5.
+    Check: assert_deployment_reproduces_forward().
+    """
+    cuda = torch.device("cuda")
+    batch = build_inputs(device=cuda)
+    model = _build_det3d_seg3d_model(whole_level_patch_sizes(batch), export_seg3d_label_fold=True)
+    model = model.cuda().eval()
     assert_deployment_reproduces_forward(model, batch, cuda, _joint_tensors, rtol=1e-5, atol=1e-5)
 
 

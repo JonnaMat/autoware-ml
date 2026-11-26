@@ -139,6 +139,7 @@ class PTv3BaseModel(ModuleBaseModel):
         point_cloud_range: Sequence[float] | None,
         log_dict_configs: LogDictConfigs,
         freeze_encoder: bool = False,
+        export_seg3d_label_fold: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the PTv3 base model.
@@ -153,6 +154,9 @@ class PTv3BaseModel(ModuleBaseModel):
             log_dict_configs: Logging configuration for training and validation.
             freeze_encoder: When ``True``, the encoder is permanently kept
                 in eval mode with its parameters frozen.
+            export_seg3d_label_fold: When ``True``, the exported seg3d head computes
+                ``pred_labels`` with :func:`argmax_by_comparison_fold` instead of an ``ArgMax``
+                node. The labels and the graph I/O are the same.
             **kwargs: Keyword arguments forwarded to :class:`ModuleBaseModel` (and
                 further up the MRO chain).
         """
@@ -171,6 +175,7 @@ class PTv3BaseModel(ModuleBaseModel):
         if self.grid_size is not None and self.point_cloud_range is not None:
             validate_serialization_geometry(encoder, self.grid_size, self.point_cloud_range)
         self.freeze_encoder = bool(freeze_encoder)
+        self.export_seg3d_label_fold = bool(export_seg3d_label_fold)
         if self.freeze_encoder:
             self.encoder.requires_grad_(False)
             self.encoder.eval()
@@ -754,6 +759,36 @@ def build_seg3d_head_input_dynamic_axes(
     return dynamic_axes
 
 
+def argmax_by_comparison_fold(scores: torch.Tensor) -> torch.Tensor:
+    """Return the index of the largest score per row, computed as a fold over the columns.
+
+    Equal to ``scores.argmax(dim=1)`` for NaN-free scores, ties included: the comparison is a
+    strict ``>``, so the first of several equal maxima wins, as in ``ArgMax`` with
+    ``select_last_index=0`` (``-0.0`` and ``+0.0`` are equal). It exports as one ``Split``,
+    ``C - 1`` ``Greater``, ``2 C - 3`` ``Where`` and one ``Squeeze`` instead of an ``ArgMax``:
+    elementwise operations that TensorRT can fuse into a single kernel, where some versions
+    compile ``ArgMax`` to a separate top-k kernel.
+
+    Args:
+        scores: ``(N, C)`` scores with a static class count ``C``.
+
+    Returns:
+        ``(N,)`` int64 index of each row's first maximal score.
+    """
+    columns = scores.split(1, dim=1)
+    if len(columns) == 1:
+        return scores.argmax(dim=1)
+    greater = columns[1] > columns[0]
+    best_score = torch.where(greater, columns[1], columns[0]) if len(columns) > 2 else columns[0]
+    best_index = torch.where(greater, 1, 0)
+    for index in range(2, len(columns)):
+        greater = columns[index] > best_score
+        if index < len(columns) - 1:
+            best_score = torch.where(greater, columns[index], best_score)
+        best_index = torch.where(greater, index, best_index)
+    return best_index.squeeze(1)
+
+
 class PTv3Seg3DHeadExportModule(nn.Module):
     """Export-only segmentation head decoding per-stage encoder features."""
 
@@ -763,6 +798,7 @@ class PTv3Seg3DHeadExportModule(nn.Module):
         serialization_orders: Sequence[str],
         sparse_shape: torch.Tensor,
         strides: Sequence[int],
+        label_fold: bool = False,
     ) -> None:
         """Initialize the segmentation head export module.
 
@@ -773,9 +809,12 @@ class PTv3Seg3DHeadExportModule(nn.Module):
                 block stages use it pooled by their cumulative pooling depth
                 (rounded up, see :func:`pooled_sparse_shape`).
             strides: Encoder pooling strides (one per pooling stage).
+            label_fold: When ``True``, ``pred_labels`` is computed with
+                :func:`argmax_by_comparison_fold` instead of ``argmax``; same labels.
         """
         super().__init__()
         self.seg3d_head = seg3d_head.prepare_for_export(serialization_orders)
+        self.label_fold = bool(label_fold)
         self.stage_count = len(strides) + 1
         self.dec_depths = list(self.seg3d_head.dec_depths)
         cumulative_depth = 0
@@ -818,6 +857,8 @@ class PTv3Seg3DHeadExportModule(nn.Module):
 
         logits = self.seg3d_head(link_stage_points(stage_feats, clusters, block_stage_metadata))
         probs = torch.softmax(logits, dim=1)
+        if self.label_fold:
+            return argmax_by_comparison_fold(probs), probs
         return probs.argmax(dim=1), probs
 
     def build_deployment_graph(self) -> DeploymentGraph:

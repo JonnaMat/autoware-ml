@@ -95,6 +95,9 @@ model:
   detection3d_loss_weight: 1.0
   grid_size: ${grid_size}
   point_cloud_range: ${point_cloud_range}
+  # the exported seg3d head computes pred_labels as a compare-and-select fold instead of
+  # ArgMax (same labels and graph I/O, see docs/models/ptv3.md)
+  export_seg3d_label_fold: false
 
   bbox_head:
     _target_: autoware_ml.models.detection3d.heads.transfusions.transfusion_head.TransFusionHead

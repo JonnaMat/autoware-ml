@@ -174,6 +174,10 @@ class PTv3Segmentation3DModel(PTv3BaseModel):
                 serialization_depth,
             ).build_deployment_graph(),
             PTv3Seg3DHeadExportModule(
-                self.seg3d_head, self.EXPORT_ORDER, sparse_shape, self.encoder.stride
+                self.seg3d_head,
+                self.EXPORT_ORDER,
+                sparse_shape,
+                self.encoder.stride,
+                label_fold=self.export_seg3d_label_fold,
             ).build_deployment_graph(),
         )

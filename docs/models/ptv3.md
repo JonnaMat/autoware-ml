@@ -243,6 +243,19 @@ The split export produces one graph per `deploy.onnx.modules` entry:
   `pooling_cluster_{S-2}`, and `point_grid_coord_{S-2}` and outputs the
   detection head tensors.
 
+### Seg3d label as a comparison fold
+
+With `model.export_seg3d_label_fold: true` (default `false`) the seg3d head graph
+computes `pred_labels` without an `ArgMax` node: it splits `pred_probs` into its
+class columns and keeps the running maximum and its index with a strict `Greater`
+and two `Where` per class (`argmax_by_comparison_fold` in `ptv3_base.py`). The
+first of several equal maxima wins, as with `ArgMax`, so the labels are the same
+for every NaN-free input, and the graph inputs and outputs do not change.
+TensorRT 10.8 on Ada GPUs compiles the `ArgMax` over the class axis to a separate
+top-k kernel and fuses the fold into one elementwise kernel, which is faster at
+large point counts. Where `ArgMax` is already cheap (TensorRT 10.14 on DRIVE
+Thor) no gain is expected, hence it is off by default.
+
 ## Implementation
 
 | Path                                                                    | Description                                        |
