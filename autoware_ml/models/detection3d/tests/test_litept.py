@@ -181,6 +181,21 @@ def test_ptv3_default_keeps_attention_everywhere_and_no_rope() -> None:
         assert block.norm0 is None
 
 
+def test_pooling_projects_first_only_after_a_convolution_only_stage() -> None:
+    """LitePT projects before the pooling gather where the previous stage has no attention."""
+
+    def project_first(encoder: LitePTEncoder) -> list[bool]:
+        return [
+            stage._modules["down"].project_first
+            for stage in encoder.enc._modules.values()
+            if "down" in stage._modules
+        ]
+
+    assert project_first(LitePTEncoder(in_channels=4)) == [True, True, True, False]
+    assert project_first(build_litept_encoder()) == [True, True]
+    assert project_first(build_ptv3_encoder()) == [False]
+
+
 def test_expand_stage_flags_rejects_a_wrong_length_sequence() -> None:
     with pytest.raises(ValueError, match="enc_attn must have 2 entries"):
         LitePTEncoder(

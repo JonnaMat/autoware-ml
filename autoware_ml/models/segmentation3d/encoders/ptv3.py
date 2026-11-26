@@ -987,6 +987,7 @@ class SerializedPooling(PointModule):
         stride: int,
         shuffle_orders: bool,
         export_stage_index: int | None = None,
+        project_first: bool = False,
     ) -> None:
         """Initialize serialized pooling.
 
@@ -996,6 +997,9 @@ class SerializedPooling(PointModule):
             stride: Hierarchical stride factor.
             shuffle_orders: Whether to shuffle serialization orders after pooling.
             export_stage_index: Pooling metadata index consumed in export mode.
+            project_first: Apply ``proj`` before the pooling row gather instead of
+                after it. Both orders compute the same rows (``proj`` is row-wise
+                and ``indices`` is a permutation); only the exported graph differs.
         """
         super().__init__()
         self.stride = stride
@@ -1003,6 +1007,7 @@ class SerializedPooling(PointModule):
         self.shuffle_orders = shuffle_orders
         self.export_mode = False
         self.export_stage_index = export_stage_index
+        self.project_first = project_first
         self.proj = FullPrecisionLinear(in_channels, out_channels)
         self.norm = PointSequential(nn.BatchNorm1d(out_channels, eps=1e-3, momentum=0.01))
         self.act = PointSequential(nn.GELU())
@@ -1064,7 +1069,15 @@ class SerializedPooling(PointModule):
                 pooled_order = pooled_order[permutation]
                 pooled_inverse = pooled_inverse[permutation]
 
-        scatter_feat = segment_csr(self.proj(point.feat[indices]), idx_ptr, "max")
+        # Gathering first lets TensorRT fuse the gather into the op that produced
+        # `point.feat`. After a convolution-only stage that op is the cpe LayerNorm
+        # plus residual, which the fused gather splits into two kernels with an fp32
+        # tensor in between; projecting first keeps the LayerNorm in one kernel.
+        if self.project_first:
+            pooled_rows = self.proj(point.feat)[indices]
+        else:
+            pooled_rows = self.proj(point.feat[indices])
+        scatter_feat = segment_csr(pooled_rows, idx_ptr, "max")
         if self.export_mode:
             scatter_coord = grid_coord.to(dtype=point.coord.dtype)
         else:
@@ -1355,6 +1368,7 @@ class PointTransformerV3Encoder(PointModule):
                         enc_channels[stage_index],
                         stride[stage_index - 1],
                         shuffle_orders,
+                        project_first=not self.enc_attn[stage_index - 1],
                     ),
                     name="down",
                 )

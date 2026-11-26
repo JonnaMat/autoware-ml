@@ -981,6 +981,35 @@ def test_serialized_pooling_export_mode_uses_precomputed_metadata(monkeypatch) -
     assert "serialized_code" not in export_out
 
 
+def test_serialized_pooling_project_first_matches_gather_first() -> None:
+    """Projecting before the row gather is the same computation reordered."""
+    torch.manual_seed(0)
+    grid_coord = torch.randint(0, 16, (64, 3), dtype=torch.int32).unique(dim=0)
+
+    def make_point() -> Point:
+        point = Point(
+            {
+                "coord": grid_coord.to(torch.float32),
+                "grid_coord": grid_coord,
+                "feat": torch.linspace(-1.0, 1.0, grid_coord.shape[0] * 6).view(-1, 6),
+                "batch": torch.zeros(grid_coord.shape[0], dtype=torch.long),
+                "offset": torch.tensor([grid_coord.shape[0]], dtype=torch.long),
+                "sparse_shape": torch.tensor([16, 16, 16], dtype=torch.long),
+            }
+        )
+        point.serialization(("z", "z-trans"), shuffle_orders=False, depth=torch.tensor(6))
+        return point
+
+    gather_first = SerializedPooling(6, 8, stride=2, shuffle_orders=False).eval()
+    project_first = SerializedPooling(6, 8, stride=2, shuffle_orders=False, project_first=True)
+    project_first.load_state_dict(gather_first.state_dict())
+    project_first.eval()
+
+    torch.testing.assert_close(
+        project_first(make_point()).feat, gather_first(make_point()).feat, rtol=0, atol=0
+    )
+
+
 def test_serialized_pooling_export_mode_rejects_shuffle_orders() -> None:
     """Export feeds fixed orders, so an export-mode pooling with shuffling on fails loudly."""
     pooling = SerializedPooling(6, 8, stride=2, shuffle_orders=True, export_stage_index=0)
